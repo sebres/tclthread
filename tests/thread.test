@@ -24,11 +24,9 @@ set dummy [makeFile dummyForTransfer dummyForTransfer]
 set tcltest::mainThread [thread::id]
 
 proc ThreadReap {} {
-    while {[llength [thread::names]] > 1} {
-        foreach tid [thread::names] {
-            if {$tid != $::tcltest::mainThread} {
-                catch {thread::release -wait $tid}
-            }
+    while {[llength [thread::names -noself]]} {
+        foreach tid [thread::names -noself] {
+            catch {thread::release -wait $tid}
         }
     }
     llength [thread::names]
@@ -42,7 +40,7 @@ test thread-2.84 {thread subcommands} {
     set cmds [info commands thread::*]
     set idx [lsearch -exact $cmds ::thread::cancel]
     lsort [lreplace $cmds $idx $idx]
-} {::thread::attach ::thread::broadcast ::thread::cond ::thread::configure ::thread::create ::thread::detach ::thread::errorproc ::thread::eval ::thread::exists ::thread::exit ::thread::id ::thread::join ::thread::mutex ::thread::names ::thread::preserve ::thread::release ::thread::rwmutex ::thread::send ::thread::transfer ::thread::unwind ::thread::wait}
+} {::thread::attach ::thread::broadcast ::thread::cond ::thread::configure ::thread::create ::thread::detach ::thread::errorproc ::thread::eval ::thread::exists ::thread::exit ::thread::exitproc ::thread::id ::thread::inscope ::thread::join ::thread::mutex ::thread::names ::thread::preserve ::thread::release ::thread::rwmutex ::thread::send ::thread::svc ::thread::transfer ::thread::unwind ::thread::wait ::thread::waitstat}
 
 test thread-3.0 {thread::names initial thread list} {
     list [ThreadReap] [llength [thread::names]]
@@ -103,7 +101,7 @@ test thread-4.4 {thread::create - create joinable thread} {
 test thread-4.5 {thread::create - join detached thread} {
     ThreadReap
     set tid [thread::create]
-    thread::send -async $tid {after 1000 ; thread::release}
+    thread::send -async $tid {after 100 ; thread::release}
     catch {set res [thread::join $tid]} msg
     ThreadReap
     lrange $msg 0 2
@@ -134,10 +132,20 @@ test thread-6.1 {thread::unwind - blocked unwind} {
     thread::create {thread::unwind; vwait dummy}
     update
     after 10
-    set l [llength [thread::names]]
+    set l [list [llength [thread::names -all]] [llength [thread::names]]]
     ThreadReap
     set l
-} {2}
+} {2 1}
+
+test thread-6.2 {thread::unwind - blocked unwind} {
+    ThreadReap
+    thread::create {thread::unwind; thread::wait}
+    update
+    after 10
+    set l [llength [thread::names -noself]]
+    ThreadReap
+    set l
+} {0}
 
 test thread-7.0 {thread::exit} {
     ThreadReap
@@ -191,12 +199,16 @@ test thread-9.0 {thread::id} {
 test thread-9.1 {thread::id - args} {
     set x [catch {thread::id x} msg]
     list $x $msg
-} {1 {wrong # args: should be "thread::id"}}
+} {1 {wrong # args: should be "thread::id ?-hex?"}}
+
+test thread-9.2 {thread::id -hex} {
+    expr { [thread::id -hex] == [regsub -- {^tid} [thread::id] {}] }
+} {1}
 
 test thread-10.0 {thread::names args} {
     set x [catch {thread::names x} msg]
     list $x $msg
-} {1 {wrong # args: should be "thread::names"}}
+} {1 {wrong # args: should be "thread::names ?-all? ?-noself?"}}
 
 test thread-11.0 {thread::send - no args} {
     set x [catch {thread::send} msg]
@@ -251,25 +263,66 @@ test thread-11.6 {thread::send - asynchronous send} {
     set five
 } {5}
 
-test thread-11.7 {thread::send - async send with event-loop wait} {
+test thread-11.7a {thread::send - async send with event-loop wait} {
     ThreadReap
     set tid [thread::create]
+    unset -nocomplain five
     thread::send -async $tid {set x 5} five
     vwait five
     ThreadReap
-    set five
-} {5}
+    list $five [thread::waitstat $five]
+} {5 0}
 
-test thread-11.8 {thread::send - send to self directly} {
+test thread-11.7b {thread::send - send to self directly} {
+    unset -nocomplain five
     thread::send [thread::id] {set x 5} five
-    set five
-} {5}
+    list $five [thread::waitstat $five]
+} {5 0}
 
-test thread-11.9 {thread::send - send to self asynchronously} {
-    set c [catch {thread::send -async [thread::id] {set x 5} five} msg]
-    list $c $msg
-} {1 {can't notify self}}
+test thread-11.8a {thread::send - send to self asynchronously} {
+    unset -nocomplain five
+    thread::send -async [thread::id] {set x 5} five
+    vwait five
+    list $five [thread::waitstat $five]
+} {5 0}
 
+test thread-11.8b {thread::send - send to self synchronously} {
+    unset -nocomplain five
+    thread::send [thread::id] {set x 5} five
+    list $five [thread::waitstat $five]
+} {5 0}
+
+test thread-11.9a {thread::send - send asynchronously with error} {
+    ThreadReap
+    set tid [thread::create]
+    set preverrproc [thread::errorproc]
+    proc myerrproc {tid msg} {}
+    thread::errorproc myerrproc
+    unset -nocomplain five
+    set ::errorCode [set ::errorInfo {nothing}]
+    thread::send -async $tid {error 5 {} E-TH-ERROR} five
+    vwait five
+    update
+    set ret [list $five [thread::waitstat $five] [regsub -all {\s+} $::errorInfo { }] $::errorCode]
+    ThreadReap
+    thread::errorproc $preverrproc
+    set ret
+} [list 5 1 "5 while executing \"error 5 {} E-TH-ERROR\"" E-TH-ERROR]
+
+test thread-11.9b {thread::send - send synchronously with error} {
+    ThreadReap
+    set tid [thread::create]
+    set preverrproc [thread::errorproc]
+    proc myerrproc {tid msg} {}
+    thread::errorproc myerrproc
+    unset -nocomplain five
+    set ::errorCode [set ::errorInfo {nothing}]
+    set stat [thread::send $tid {error 5 {} E-TH-ERROR} five]
+    set ret [list $five $stat [regsub -all {\s+} $::errorInfo { }] $::errorCode]
+    ThreadReap
+    thread::errorproc $preverrproc
+    set ret
+} [list 5 1 "5 while executing \"error 5 {} E-TH-ERROR\"" E-TH-ERROR]
 
 test thread-11.10 {thread::send - preserve errorInfo} {
     ThreadReap
@@ -295,6 +348,7 @@ test thread-11.11 {Thread_Send preserve errorCode} {
 test thread-12.0 {thread::wait} {
     ThreadReap
     set tid [thread::create {set x 5; thread::wait}]
+    unset -nocomplain five
     thread::send $tid {set x} five
     ThreadReap
     set five
@@ -424,13 +478,15 @@ test thread-15.8 {thread::configure - set -eventmark option} {
     set tid [thread::create]
     update
     after 10
+		## limit queue of thread to 1:
     thread::configure $tid -eventmark 1
-    thread::send -async $tid {after 2000}
-    set t1 [clock seconds]
-    thread::send -async $tid {after 2000}
-    set t2 [clock seconds]
+    thread::send -async $tid {after 100}
+    set t1 [clock milliseconds]
+		## -async will be blocked here for 200 ms, cause of limit 1:
+    thread::send -async $tid {set ok 1}
+    set t2 [clock milliseconds]
     ThreadReap
-    expr {($t2 - $t1) >= 2}
+    expr {($t2 - $t1) >= 100}
 } {1}
 
 test thread-16.0 {thread::errorproc - args} {
@@ -483,7 +539,7 @@ test thread-17.2 {thread::transfer - target thread dying} {chanTransfer} {
     ThreadReap
     set tid [thread::create]
     set file [open $dummy r]
-    thread::send -async $tid {after 3000 ; thread::release}
+    thread::send -async $tid {after 100 ; thread::release}
     catch {thread::transfer $tid $file} msg
     close $file
     ThreadReap
@@ -861,20 +917,18 @@ test thread-19.12 {thread::mutex - lock exclusive between threads} {
     ThreadReap
     set tid [thread::create]
     set emutex [thread::mutex create]
+    thread::send $tid [list thread::mutex lock $emutex]
+    set time1 [clock milliseconds]
     thread::send -async $tid [subst {
-        thread::mutex lock $emutex
-        after 2000
+        after 100
         thread::mutex unlock $emutex
     }]
-    update
-    after 10
-    set time1 [clock seconds]
     thread::mutex lock $emutex
-    set time2 [clock seconds]
+    set time2 [clock milliseconds]
     thread::mutex unlock $emutex
     ThreadReap
     thread::mutex destroy $emutex
-    expr {($time2 - $time1) >= 1}
+    expr {($time2 - $time1) >= 100}
 } {1}
 
 test thread-19.13 {thread::mutex - lock args} {
@@ -946,40 +1000,38 @@ test thread-20.8 {thread::rwmutex - readlock mutex} {
     ThreadReap
     set tid [thread::create]
     set rwmutex [thread::rwmutex create]
+    thread::send $tid [list thread::rwmutex rlock $rwmutex]
+    set time1 [clock milliseconds]
     thread::send -async $tid [subst {
-        thread::rwmutex rlock $rwmutex
-        after 1000
+        after 100
         thread::rwmutex unlock $rwmutex
     }]
-    update
-    after 10
-    set time1 [clock seconds]
     thread::rwmutex rlock $rwmutex
-    set time2 [clock seconds]
+    set time2 [clock milliseconds]
     thread::rwmutex unlock $rwmutex
-    ThreadReap
+    thread::rwmutex wlock $rwmutex
+    thread::rwmutex unlock $rwmutex
     thread::rwmutex destroy $rwmutex
-    expr {($time2 - $time1) < 1}
+    ThreadReap
+    expr {($time2 - $time1) < 100}
 } {1}
 
 test thread-20.9 {thread::rwmutex - writelock mutex} {
     ThreadReap
     set tid [thread::create]
     set rwmutex [thread::rwmutex create]
+    thread::send $tid [list thread::rwmutex wlock $rwmutex]
+    set time1 [clock milliseconds]
     thread::send -async $tid [subst {
-        thread::rwmutex wlock $rwmutex
-        after 2000
+        after 100
         thread::rwmutex unlock $rwmutex
     }]
-    update
-    after 10
-    set time1 [clock seconds]
     thread::rwmutex rlock $rwmutex
-    set time2 [clock seconds]
+    set time2 [clock milliseconds]
     thread::rwmutex unlock $rwmutex
     ThreadReap
     thread::rwmutex destroy $rwmutex
-    expr {($time2 - $time1) >= 1}
+    expr {($time2 - $time1) >= 100}
 } {1}
 
 test thread-20.10 {thread::rwmutex - readlock args} {
@@ -1141,44 +1193,43 @@ test thread-21.15 {thread::cond - regular timed wait} {
     set tid [thread::create]
     set emutex [thread::mutex create]
     set cond [thread::cond create]
+    thread::send $tid [list thread::mutex lock $emutex]
+    set test 0
     thread::send -async $tid [subst {
-        thread::mutex lock $emutex
-        thread::cond wait $cond $emutex 2000
+        thread::cond wait $cond $emutex 1000
         thread::mutex unlock $emutex
         set test 1
-    }]
-    update
-    after 10
-    set time1 [clock seconds]
+    }] test
+    set time1 [clock milliseconds]
+    thread::mutex lock $emutex
+    thread::mutex unlock $emutex
     thread::cond notify $cond
     set c [thread::send $tid "info exists test"]
-    set time2 [clock seconds]
+    set time2 [clock milliseconds]
     ThreadReap
     thread::mutex destroy $emutex
     thread::cond destroy $cond
-    list $c [expr {($time2 - $time1) < 2}]
-} {1 1}
+    update
+    list $c [expr {($time2 - $time1) < 1000}] $test
+} {1 1 1}
 
 test thread-21.16 {thread::cond - delete waited variable} {
     ThreadReap
     set tid [thread::create]
     set emutex [thread::mutex create]
     set cond [thread::cond create]
-    thread::send -async $tid [subst {
-        thread::mutex lock $emutex
-        thread::cond wait $cond $emutex 500
-        thread::mutex unlock $emutex
-    }]
-    update
-    after 10
+    thread::send $tid [list thread::mutex lock $emutex]
+    thread::send -async $tid [list thread::cond wait $cond $emutex 1000]
+    thread::mutex lock $emutex
     set c1 [catch {thread::cond destroy $cond} r1]
     thread::cond notify $cond
-    after 1000
+    thread::mutex unlock $emutex
+    thread::send $tid [list thread::mutex unlock $emutex]
     set c2 [catch {thread::cond destroy $cond} r2]
     ThreadReap
     thread::mutex destroy $emutex
-    list $c1 $c2 $r1 $r2
-} {1 0 {condition variable is in use} {}}
+    list $c1 $r1 $c2 $r2
+} {1 {condition variable is in use} 0 {}}
 
 removeFile dummyForTransfer
 ::tcltest::cleanupTests

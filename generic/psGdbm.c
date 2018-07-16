@@ -70,6 +70,12 @@ Sv_RegisterGdbmStore(void)
 
 /*
  *-----------------------------------------------------------------------------
+ */
+void ps_gdbm_fatal_cb(const char *msg) {
+    Tcl_Panic("gdbm-storage error: %s", msg);
+}
+/*
+ *-----------------------------------------------------------------------------
  *
  * ps_gdbm_open --
  *
@@ -93,7 +99,7 @@ ps_gdbm_open(
 
     Tcl_DStringInit(&toext);
     ext = Tcl_UtfToExternalDString(NULL, path, strlen(path), &toext);
-    dbf = gdbm_open(ext, 512, GDBM_WRCREAT|GDBM_SYNC|GDBM_NOLOCK, 0666, NULL);
+    dbf = gdbm_open(ext, 512, GDBM_WRCREAT, 0666, ps_gdbm_fatal_cb);
     Tcl_DStringFree(&toext);
 
     return (ClientData)dbf;

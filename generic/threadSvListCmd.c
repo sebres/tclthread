@@ -290,8 +290,8 @@ SvLappendObjCmd(arg, interp, objc, objv)
     int objc;
     Tcl_Obj *const objv[];
 {
-    int i, ret, flg, off;
-    Tcl_Obj *dup;
+    int i, j, ret, flg, off, index, nargs;
+    Tcl_Obj *dup, **args;
     Container *svObj = (Container*)arg;
 
     /*
@@ -305,17 +305,41 @@ SvLappendObjCmd(arg, interp, objc, objv)
     if (ret != TCL_OK) {
         return TCL_ERROR;
     }
-    if ((objc - off) < 1) {
+    nargs = objc - off;
+    if (nargs < 1) {
         Tcl_WrongNumArgs(interp, off, objv, "value ?value ...?");
         goto cmd_err;
     }
-    for (i = off; i < objc; i++) {
-        dup = Sv_DuplicateObj(objv[i]);
+    if (nargs == 1) {
+        dup = Sv_DuplicateObj(objv[off]);
         ret = Tcl_ListObjAppendElement(interp, svObj->tclObj, dup);
         if (ret != TCL_OK) {
             Tcl_DecrRefCount(dup);
             goto cmd_err;
+        }        
+    } else {
+        ret = Tcl_ListObjLength(interp, svObj->tclObj, &index);
+        if (ret != TCL_OK) {
+            goto cmd_err;
         }
+        args  = (Tcl_Obj**)ckalloc(nargs * sizeof(Tcl_Obj*));
+        if (args == NULL) {
+            goto cmd_err;
+        }
+        
+        for (i = off, j = 0; i < objc; i++, j++) {
+            args[j] = Sv_DuplicateObj(objv[i]);
+        }
+        ret = Tcl_ListObjReplace(interp, svObj->tclObj, index, 0, nargs, args);
+        if (ret != TCL_OK) {
+            for (j = 0; j < nargs; j++) {
+                Tcl_DecrRefCount(args[j]);
+            }
+            ckfree((char*)args);
+            goto cmd_err;
+        }
+
+        ckfree((char*)args);
     }
 
     Tcl_SetObjResult(interp, Sv_DuplicateObj(svObj->tclObj));
@@ -404,6 +428,9 @@ SvLreplaceObjCmd (arg, interp, objc, objv)
     nargs = objc - (off + 2);
     if (nargs) {
         args = (Tcl_Obj**)ckalloc(nargs * sizeof(Tcl_Obj*));
+        if (args == NULL) {
+            goto cmd_err;
+        }
         for(i = off + 2, j = 0; i < objc; i++, j++) {
             args[j] = Sv_DuplicateObj(objv[i]);
         }
@@ -491,6 +518,9 @@ SvLrangeObjCmd (arg, interp, objc, objv)
 
     nargs = last - first + 1;
     args  = (Tcl_Obj**)ckalloc(nargs * sizeof(Tcl_Obj*));
+    if (args == NULL) {
+        goto cmd_err;
+    }
     for (i = first, j = 0; i <= last; i++, j++) {
         args[j] = Sv_DuplicateObj(elPtrs[i]);
     }
@@ -565,6 +595,9 @@ SvLinsertObjCmd (arg, interp, objc, objv)
 
     nargs = objc - (off + 1);
     args  = (Tcl_Obj**)ckalloc(nargs * sizeof(Tcl_Obj*));
+    if (args == NULL) {
+        goto cmd_err;
+    }
     for (i = off + 1, j = 0; i < objc; i++, j++) {
          args[j] = Sv_DuplicateObj(objv[i]);
     }

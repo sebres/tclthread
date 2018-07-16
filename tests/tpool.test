@@ -1,1 +1,221 @@
-return
+# Commands covered:  tpool
+#
+# This file contains a collection of tests for one or more of the Tcl
+# built-in commands.  Sourcing this file into Tcl runs the tests and
+# generates output for errors.  No output means no errors were found.
+#
+# Copyright (c) 1996 Sun Microsystems, Inc.
+# Copyright (c) 1998-2000 Scriptics Corporation.
+# Copyright (c) 2002 ActiveState Corporation.
+# Copyright (c) 2016 Serg G. Brester (sebres)
+#
+# See the file "license.terms" for information on usage and redistribution
+# of this file, and for a DISCLAIMER OF ALL WARRANTIES.
+
+package require tcltest
+namespace import ::tcltest::*
+tcltest::loadTestedCommands
+package require Thread
+
+tcltest::testConstraint chanTransfer               \
+    [expr {   $::tcl_platform(platform) == "unix"  \
+           || $::tcl_patchLevel > "8.4.10"}]
+
+set tcltest::mainThread [thread::id]
+
+proc TpoolReap {} {
+    ## pools down:
+    foreach tp [tpool::names] {
+        tpool::release $tp
+    }
+    ## threads down:
+    ThreadReap
+}
+
+proc Wait4Cond {var cond {init {}} {timeout 1000}} {
+    ## create timeout event:
+    set to [after $timeout [list unset $var]]
+    ## wait for completion:
+    while $cond {
+        vwait $var
+        if {![info exists $var]} {
+            set $var "Z TIMEOUT $timeout"
+            break
+        }
+    }
+    after cancel $to
+    set ret [set $var]
+    unset -nocomplain $var
+    return $ret
+}
+
+proc TpoolWait4Ready {tp {wrkcond 1} {timeout 1000}} {
+    set ::thread_test 0
+    ## create notifier and notify master from each pool worker if ready :
+    tpool::post -distribute -broadcast $tp {proc __notify_master {mtid wrkcond} {
+        ## don't use vwait directly, just check condition and if false create an after-event to check it later again:
+        if { ![catch {
+            if $wrkcond {set c 1} else {set c 0}
+        } c] && $c } {
+            thread::send $mtid {incr ::thread_test}
+        } else {
+            after 10 [info level [info level]]
+        }
+    }}
+    tpool::post -distribute -broadcast $tp [list __notify_master [thread::id] $wrkcond]
+    ## create timeout event:
+    set thcnt [llength [tpool::names $tp]]
+    set to [after $timeout [list set ::thread_test "Z TIMEOUT $timeout"]]
+    ## wait for completion:
+    while {$::thread_test < $thcnt} {vwait ::thread_test}
+    after cancel $to
+    set ret $::thread_test
+    unset -nocomplain ::thread_test
+    return $ret
+}
+
+## ----------------------------
+
+test tpool-2.0 {no global tpool command} {
+    info commands tpool
+} {}
+
+test tpool-2.1 {tpool subcommands} {
+    lsort [info commands tpool::*]
+} {::tpool::cancel ::tpool::create ::tpool::get ::tpool::names ::tpool::post ::tpool::preserve ::tpool::release ::tpool::reload ::tpool::resume ::tpool::suspend ::tpool::wait}
+
+test tpool-2.2 {tpool::names initial pool list} {
+    list [llength [tpool::names]] [TpoolReap]
+} {0 1}
+
+test tpool-2.3 {tpool::names pool list} {
+    tpool::create
+    list \
+      [llength [tpool::names]] \
+      [TpoolReap] \
+      [llength [tpool::names]]
+} {1 1 0}
+
+test tpool-2.5 {tpool::create with one thread} {
+    ## create pool with exeact one thread and make it as public thread through call of thread::id
+    tpool::create -minworkers 1 -maxworkers 1 -initcmd {thread::id}
+    list \
+      [llength [tpool::names]] [llength [thread::names -noself]] \
+      [TpoolReap] \
+      [llength [tpool::names]] [llength [thread::names -noself]]
+} {1 1 1 0 0}
+
+test tpool-2.6 {tpool::names get the pool threads} {
+    set tp [tpool::create -minworkers 3 -maxworkers 3 -initcmd {thread::id}]
+    set ret [llength [tpool::names $tp]]
+    TpoolReap
+    set ret
+} {3}
+
+test tpool-2.7 {tpool::names get the shutdown pool threads} {
+    set tp [tpool::create -minworkers 1]
+    set ret [llength [tpool::names $tp]]
+    TpoolReap
+    lappend ret [catch {tpool::names $tp} err] $err $::errorCode
+} {1 1 {threadpool is shut down} {TCL ESHUTDOWN}}
+
+
+test tpool-3.1 {tpool::post synchronously with wait/get} {
+    ## create pool with exeact one thread
+    set tp [tpool::create -minworkers 1 -maxworkers 1 -initcmd {thread::id}]
+    set jobs [set ret {}]
+    lappend jobs [tpool::post $tp {set x ok}]
+    lappend jobs [tpool::post $tp {set y done}]
+    set to [after 1000 {set ::thread_test {timeout}}]
+    set ::thread_test {}
+    ## wait for completion:
+    while {$::thread_test eq "" && [llength $ret] < 2} { update; set ret [tpool::wait $tp $jobs] }
+    after cancel $to
+    lappend ret [catch {
+      lappend ret [tpool::get $tp [lindex $jobs 0]]
+      lappend ret [tpool::get $tp [lindex $jobs 1]]
+    }]
+    TpoolReap
+    unset ::thread_test
+    set ret
+} {1 2 ok done 0}
+
+test tpool-3.2 {tpool::post synchronously with wait/get on error} {
+    ## create pool with exeact one thread
+    set tp [tpool::create -minworkers 1 -maxworkers 1 -initcmd {thread::id}]
+    set job [tpool::post $tp {error test {} E-TH-ERROR}]
+    set ret [tpool::wait $tp [list $job]]
+    lappend ret [catch {tpool::get $tp $job} err]
+    lappend ret $err [regsub -all {\s+} $::errorInfo { }] $::errorCode
+    TpoolReap
+    set ret
+} {1 1 test {test while executing "error test {} E-TH-ERROR" invoked from within "tpool::get $tp $job"} E-TH-ERROR}
+
+
+test tpool-4.1 {tpool::post asynchronously} {
+    ## create pool with exeact one thread
+    set tp [tpool::create -minworkers 1 -maxworkers 1 -initcmd {thread::id}]
+    set ret {}
+    ## test new style (-async) and old style (-detached for backwards compatibility):
+    lappend ret [tpool::post -async $tp {set x ok}]
+    lappend ret [tpool::post -detached $tp {lappend x done}]
+    ## wait for completion:
+    TpoolWait4Ready $tp {[llength $::x] >= 2}
+    lappend ret [thread::send [lindex [thread::names -noself] 0] {set x}]
+    TpoolReap
+    set ret
+} {{} {} {ok done}}
+
+test tpool-4.2 {tpool::post asynchronously with error, wait using error handler} {
+    ## create pool with exeact one thread
+    set tp [tpool::create -minworkers 1 -maxworkers 1 -initcmd {thread::id}]
+    set preverrproc [thread::errorproc]
+    set ::thread_test {}
+    proc myerrproc {tid msg} {lappend ::thread_test [regsub -all {\s+} $msg { }]}
+    thread::errorproc myerrproc
+    set ret {}
+    ## test new style (-async) and old style (-detached for backwards compatibility):
+    lappend ret [tpool::post -async $tp {error test1}]
+    lappend ret [tpool::post -detached $tp {error test2}]
+    ## wait for completion:
+    lappend ret {*}[lsort [Wait4Cond ::thread_test {[llength $::thread_test] < 2}]]
+    TpoolReap
+    thread::errorproc $preverrproc
+    set ret
+} {{} {} {test1 while executing "error test1"} {test2 while executing "error test2"}}
+
+
+test tpool-5.1 {tpool::post asynchronously multithreaded} {
+    ## create pool with 3 thread
+    set tp [tpool::create -minworkers 3 -maxworkers 3 -initcmd {thread::id}]
+    ## send
+    time { tpool::post -async $tp { set x ok; after 10 } } 3
+    tpool::post -async -broadcast $tp { lappend x done; after 10 }
+    ## wait for completion:
+    set ret [TpoolWait4Ready $tp {[llength $::x] >= 2}]
+    foreach tid [thread::names -noself] {
+      lappend ret [thread::send $tid {set x}]
+    }
+    TpoolReap
+    set ret
+} {3 {ok done} {ok done} {ok done}}
+
+test tpool-5.2 {tpool check pool threads recive directly the tcl events} {
+    ## create pool with 3 thread
+    set tp [tpool::create -minworkers 3 -maxworkers 3 -initcmd {thread::id}]
+    ## send several events :
+    thread::broadcast {after 20 {after idle {lappend x bc}}}
+    tpool::post -async -broadcast $tp { set x ok; after 20 }
+    set tptids [tpool::names $tp]
+    set i 0; foreach tid $tptids {
+      thread::send -async $tid [list lappend x done-[incr i]]
+    }
+    ## wait for completion:
+    set ret [TpoolWait4Ready $tp {[llength $::x] >= 3}]
+    foreach tid $tptids {
+      lappend ret [thread::send $tid {set x}]
+    }
+    TpoolReap
+    set ret
+} {3 {ok done-1 bc} {ok done-2 bc} {ok done-3 bc}}
+

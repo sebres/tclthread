@@ -47,6 +47,7 @@ static const Tcl_ObjType* booleanObjTypePtr;
 static const Tcl_ObjType* byteArrayObjTypePtr;
 static const Tcl_ObjType* doubleObjTypePtr;
 static const Tcl_ObjType* intObjTypePtr;
+static const Tcl_ObjType* wideIntObjTypePtr;
 static const Tcl_ObjType* stringObjTypePtr;
 
 /*
@@ -116,7 +117,7 @@ static Array* LockArray(Tcl_Interp*, const char*, int);
 static int ReleaseContainer(Tcl_Interp*, Container*, int);
 static int DeleteContainer(Container*);
 static int FlushArray(Array*);
-static int DeleteArray(Array*);
+static int DeleteArray(Tcl_Interp *, Array*);
 
 static void SvAllocateContainers(Bucket*);
 static void SvRegisterStdCommands(void);
@@ -836,20 +837,37 @@ CreateArray(
  */
 
 static int
-DeleteArray(Array *arrayPtr)
+UnbindArray(Tcl_Interp *interp, Array *arrayPtr)
+{
+    PsStore *psPtr = arrayPtr->psPtr;
+    if (arrayPtr->bindAddr) {
+        ckfree(arrayPtr->bindAddr);
+        arrayPtr->bindAddr = NULL;
+    }
+    if (psPtr) {
+        if (psPtr->psClose(psPtr->psHandle) == -1) {
+            if (interp) {
+                const char *err = psPtr->psError(psPtr->psHandle);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj(err, -1));
+            }
+            return TCL_ERROR;
+        }
+        ckfree((char*)arrayPtr->psPtr), arrayPtr->psPtr = NULL;
+        arrayPtr->psPtr = NULL;
+    }
+    return TCL_OK;
+}
+
+static int
+DeleteArray(Tcl_Interp *interp, Array *arrayPtr)
 {
     if (FlushArray(arrayPtr) == -1) {
         return TCL_ERROR;
     }
     if (arrayPtr->psPtr) {
-        PsStore *psPtr = arrayPtr->psPtr;
-        if (psPtr->psClose(psPtr->psHandle) == -1) {
+        if (UnbindArray(interp, arrayPtr) != TCL_OK) {
             return TCL_ERROR;
-        }
-        ckfree((char*)arrayPtr->psPtr), arrayPtr->psPtr = NULL;
-    }
-    if (arrayPtr->bindAddr) {
-        ckfree(arrayPtr->bindAddr);
+        };
     }
     if (arrayPtr->entryPtr) {
         Tcl_DeleteHashEntry(arrayPtr->entryPtr);
@@ -950,7 +968,8 @@ SvFinalizeContainers(Bucket *bucketPtr)
  *  is done as follows:
  *
  *     1) Scalar Tcl object types are properly copied by default;
- *        these include: boolean, int double, string and byteArray types.
+ *        these include: boolean, int, wideInt, double, string and byteArray
+ *        types.
  *     2) Object registered with Sv_RegisterObjType are duplicated
  *        using custom duplicator function which is guaranteed to
  *        produce a proper deep copy of the object in question.
@@ -996,12 +1015,15 @@ Sv_DuplicateObj(objPtr)
                 || objPtr->typePtr == byteArrayObjTypePtr  \
                 || objPtr->typePtr == doubleObjTypePtr     \
                 || objPtr->typePtr == intObjTypePtr        \
-                || objPtr->typePtr == stringObjTypePtr) {
+                || objPtr->typePtr == wideIntObjTypePtr    \
+                || objPtr->typePtr == stringObjTypePtr
+                || objPtr->typePtr == &TpoolObjType
+                || objPtr->typePtr == &ThreadObjType) {
                /*
                 * Cover all "safe" obj types (see header comment)
                 */
-              (*objPtr->typePtr->dupIntRepProc)(objPtr, dupPtr);
-              Tcl_InvalidateStringRep(dupPtr);
+                (*objPtr->typePtr->dupIntRepProc)(objPtr, dupPtr);
+                Tcl_InvalidateStringRep(dupPtr);
             } else {
                 int found = 0;
                 register RegType *regPtr;
@@ -1045,6 +1067,8 @@ Sv_DuplicateObj(objPtr)
         }
         dupPtr->length = objPtr->length;
         dupPtr->bytes[objPtr->length] = '\0';
+    } else {
+        dupPtr->bytes = Sv_tclEmptyStringRep;
     }
 
     return dupPtr;
@@ -1381,17 +1405,12 @@ SvArrayObjCmd(
         }
 
     } else if (index == AUNBIND) {
-        if (arrayPtr && arrayPtr->psPtr) {
-            PsStore *psPtr = arrayPtr->psPtr;
-            if (psPtr->psClose(psPtr->psHandle) == -1) {
-                const char *err = psPtr->psError(psPtr->psHandle);
-                Tcl_SetObjResult(interp, Tcl_NewStringObj(err, -1));
-                ret = TCL_ERROR;
-                goto cmdExit;
-            }
-            ckfree((char*)arrayPtr->psPtr), arrayPtr->psPtr = NULL;
-        } else {
+        if (!arrayPtr || !arrayPtr->psPtr) {
             Tcl_AppendResult(interp, "shared variable is not bound", NULL);
+            ret = TCL_ERROR;
+            goto cmdExit;
+        }
+        if (UnbindArray(interp, arrayPtr) != TCL_OK) {
             ret = TCL_ERROR;
             goto cmdExit;
         }
@@ -1446,7 +1465,7 @@ SvUnsetObjCmd(
     }
     if (objc == 2) {
         UnlockArray(arrayPtr);
-        if (DeleteArray(arrayPtr) != TCL_OK) {
+        if (DeleteArray(interp, arrayPtr) != TCL_OK) {
             return TCL_ERROR;
         }
     } else {
@@ -2237,6 +2256,10 @@ Sv_Init (interp)
     intObjTypePtr       = obj->typePtr;
     Tcl_DecrRefCount(obj);
 
+    obj = Tcl_NewWideIntObj(0);
+    wideIntObjTypePtr   = obj->typePtr;
+    Tcl_DecrRefCount(obj);
+
     /*
      * Plug-in registered commands in current interpreter
      */
@@ -2352,7 +2375,10 @@ SvFinalize (ClientData clientData)
                 while (hashPtr != NULL) {
                     Array *arrayPtr = (Array*)Tcl_GetHashValue(hashPtr);
                     UnlockArray(arrayPtr);
-                    DeleteArray(arrayPtr);
+                    /* unbind array before delete (avoid flush of persistent storage) */
+                    UnbindArray(NULL, arrayPtr);
+                    /* flush, delete etc. */
+                    DeleteArray(NULL, arrayPtr);
                     hashPtr = Tcl_NextHashEntry(&search);
                 }
                 if (bucketPtr->lock) {

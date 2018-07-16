@@ -11,16 +11,38 @@
  */
 
 #include "tclThreadInt.h"
+#include "threadSvCmd.h"
 
 /*
- * Structure to maintain idle poster threads
+ * Structure to maintain workers of thread pool
  */
 
-typedef struct TpoolWaiter {
+typedef struct ThreadPool ThreadPool;
+
+typedef struct TpoolWorker {
     Tcl_ThreadId threadId;         /* Thread id of the current thread */
-    struct TpoolWaiter *nextPtr;   /* Next structure in the list */
-    struct TpoolWaiter *prevPtr;   /* Previous structure in the list */
-} TpoolWaiter;
+    int          flags;            /* Flags and signals to recognize idle/wait state */
+    ThreadPool  *tpoolPtr;         /* Thread pool */
+    Tcl_Interp  *interp;           /* Tcl interp of this thread */
+    Tcl_Obj     *idleScript;       /* Idle script command object */
+    Tcl_Obj     *idleIntScript;    /* Idle interval script command object */
+    Tcl_Time     idleStartTm;      /* Last time the worker goes idle (used for timeout) */
+    Tcl_Time     idleIntTm;        /* Last time the worker executed idle interval command */
+    struct TpoolWorker *nextIdl;   /* Next idle in the ring list */
+    struct TpoolWorker *prevIdl;   /* Previous idle in the ring list */
+    struct TpoolWorker *nextWrk;   /* Next structure in the ring list */
+    struct TpoolWorker *prevWrk;   /* Previous structure in the ring list */
+} TpoolWorker;
+
+#define TPWRK_FLAG_IDLE    (1<<0)  /* Still idle */
+#define TPWRK_FLAG_INWORK  (1<<1)  /* Worker process pool work */
+#define TPWRK_FLAG_IDLLAT  (1<<2)  /* Idle latency elapsed */
+#define TPWRK_FLAG_IDLINT  (1<<3)  /* Idle interval "timer" created (but not yet executed) */
+#define TPWRK_FLAG_IDLTMR  (1<<4)  /* Idle timeout event created (but not yet executed) */
+#define TPWRK_FLAG_IDLTOUT (1<<5)  /* Signaled if idle timeout occurred */
+#define TPWRK_FLAG_SVC     (1<<6)  /* Signaled it was a service event (no work), idle will be continued */
+
+#define TPWRK_FLAG_ERROR   (1<<8)  /* Signaled thread has initialization error (error in initScript) */
 
 /*
  * Structure describing an instance of a thread pool.
@@ -28,31 +50,52 @@ typedef struct TpoolWaiter {
 
 typedef struct ThreadPool {
     Tcl_WideInt jobId;              /* Job counter */
-    int idleTime;                   /* Time in secs a worker thread idles */
+    Tcl_Time    idleTime;           /* Time a worker thread tear down after it is idle */
+    Tcl_Time    idleLatency;        /* Latency after idle at the earliest a worker will execute an idle script */
+    Tcl_Time    idleIntTime;        /* Interval a worker will execute an idle interval script */
     int tearDown;                   /* Set to 1 to tear down the pool */
     int suspend;                    /* Set to 1 to suspend pool processing */
-    char *initScript;               /* Script to initialize worker thread */
-    char *exitScript;               /* Script to cleanup the worker */
+    int flags;                      /* Pool flags (discrete mode, etc) */
+    Tcl_Obj *initScript;            /* Script to initialize worker thread */
+    Tcl_Obj *exitScript;            /* Script to cleanup the worker */
+    Tcl_Obj *idleScript;            /* Script executed if thread goes idle (once it has no work) */
+    Tcl_Obj *idleIntScript;         /* Script executed if thread goes idle (once it has no work) */
     int minWorkers;                 /* Minimum number or worker threads */
     int maxWorkers;                 /* Maximum number of worker threads */
     int numWorkers;                 /* Current number of worker threads */
+    int stopWorkers;                /* Current number of worker will shut down */
     int idleWorkers;                /* Number of idle workers */
     int refCount;                   /* Reference counter for reserve/release */
-    Tcl_Mutex mutex;                /* Pool mutex */
+    int objRefCount;                /* Reference counter (all tcl objects), protected within listMutex */
+    Tcl_Mutex mutex;                /* Pool mutex (work queue, properties, etc.) */
+    Tcl_Mutex startMutex;           /* Start mutex (start worker, suspend/resume, etc.) */
     Tcl_Condition cond;             /* Pool condition variable */
     Tcl_HashTable jobsDone;         /* Stores processed job results */
+    Tcl_ThreadId  waiterId;         /* Thread id of single waiter, currently used for tear down only (thread free pool) */
     struct TpoolResult *workTail;   /* Tail of the list with jobs pending*/
     struct TpoolResult *workHead;   /* Head of the list with jobs pending*/
-    struct TpoolWaiter *waitTail;   /* Tail of the thread waiters list */
-    struct TpoolWaiter *waitHead;   /* Head of the thread waiters list */
+    struct TpoolWorker *workerRing; /* Head/Tail of the workers ring buffer */
+    struct TpoolWorker *idleRing;   /* Head/Tail of the idle workers list (ring buffer) */
     struct ThreadPool *nextPtr;     /* Next structure in the threadpool list */
     struct ThreadPool *prevPtr;     /* Previous structure in threadpool list */
 } ThreadPool;
+
+#define TPOOL_SUSPEND_JOBS (1<<0)   /* Suspend jobs (work queue or distributed), but process tcl events */
+#define TPOOL_SUSPEND_FULL (1<<1)   /* Totally suspend work (also tcl events) */
+
+#define TPOOL_FLAG_DISCRETE       (1<<2)  /* Discrete mode - disable process queued or distributed work (but process tcl events) */
+#define TPOOL_FLAG_SHIFT_IDLERING (1<<3)  /* Shift idle ring mode - if on, add to tail, otherwise (default) add again to head
+                                           * of idle ring (prefer the last working thread) */
 
 #define TPOOL_HNDLPREFIX  "tpool"   /* Prefix to generate Tcl pool handles */
 #define TPOOL_MINWORKERS  0         /* Default minimum # of worker threads */
 #define TPOOL_MAXWORKERS  4         /* Default maximum # of worker threads */
 #define TPOOL_IDLETIMER   0         /* Default worker thread idle timer */
+#define TPOOL_IDLELATENCY 0.5       /* Default time of idle command of worker thread */
+#define TPOOL_IDLEINT     5         /* Default idle interval of worker thread */
+                                    /* Default pool flags (discrete mode) */
+#define TPOOL_FLAGS       TPOOL_FLAG_DISCRETE
+            
 
 /*
  * Structure for passing evaluation results
@@ -61,26 +104,27 @@ typedef struct ThreadPool {
 typedef struct TpoolResult {
     int detached;                   /* Result is to be ignored */
     Tcl_WideInt jobId;              /* The job id of the current job */
-    char *script;                   /* Script to evaluate in worker thread */
-    int scriptLen;                  /* Length of the script */
-    int retcode;                    /* Tcl return code of the current job */
-    char *result;                   /* Tcl result of the current job */
-    char *errorCode;                /* On error: content of the errorCode */
-    char *errorInfo;                /* On error: content of the errorInfo */
+    Tcl_Obj *script;                /* Script to evaluate in worker thread */
+    Tcl_Obj *resultObj;             /* Result or Return state object (content of the errorCode, errorInfo, etc.) */
     Tcl_ThreadId threadId;          /* Originating thread id */
     ThreadPool *tpoolPtr;           /* Current thread pool */
     struct TpoolResult *nextPtr;
     struct TpoolResult *prevPtr;
 } TpoolResult;
 
+/* Event structure used to signal / distribute work to the worker */
+typedef struct TpoolEvent {
+    TpoolWorker *poolWrk;             /* Structure of worker thread */
+    TpoolResult *rPtr;                /* Work used to distribute to the worker directly */
+} TpoolEvent;
+
 /*
  * Private structure for each worker/poster thread.
  */
 
-typedef struct ThreadSpecificData {
+typedef struct TpoolSpecificData {
     int stop;                       /* Set stop event; exit from event loop */
-    TpoolWaiter *waitPtr;           /* Threads private idle structure */
-} ThreadSpecificData;
+} TpoolSpecificData;
 
 static Tcl_ThreadDataKey dataKey;
 
@@ -90,19 +134,13 @@ static Tcl_ThreadDataKey dataKey;
 
 static ThreadPool *tpoolList;
 static Tcl_Mutex listMutex;
-static Tcl_Mutex startMutex;
-
-/*
- * Used to represent the empty result.
- */
-
-static char *threadEmptyResult = (char *)"";
 
 /*
  * Functions implementing Tcl commands
  */
 
 static Tcl_ObjCmdProc TpoolCreateObjCmd;
+static Tcl_ObjCmdProc TpoolReloadObjCmd;
 static Tcl_ObjCmdProc TpoolPostObjCmd;
 static Tcl_ObjCmdProc TpoolWaitObjCmd;
 static Tcl_ObjCmdProc TpoolCancelObjCmd;
@@ -118,10 +156,13 @@ static Tcl_ObjCmdProc TpoolNamesObjCmd;
  */
 
 static int
-CreateWorker(Tcl_Interp *interp, ThreadPool *tpoolPtr);
+CreateWorker(Tcl_Interp *interp, ThreadPool *tpoolPtr, int lock);
 
 static Tcl_ThreadCreateType
-TpoolWorker(ClientData clientData);
+TpoolWorkerProc(ClientData clientData);
+
+static int
+TpoolReloadEvent(Tcl_Event *evPtr, int mask);
 
 static int
 RunStopEvent(Tcl_Event *evPtr, int mask);
@@ -129,32 +170,33 @@ RunStopEvent(Tcl_Event *evPtr, int mask);
 static void
 PushWork(TpoolResult *rPtr, ThreadPool *tpoolPtr);
 
+#define HasWork(tpoolPtr) (tpoolPtr->workTail != NULL)
+
 static TpoolResult*
 PopWork(ThreadPool *tpoolPtr);
 
-static void
-PushWaiter(ThreadPool *tpoolPtr);
-
-static TpoolWaiter*
-PopWaiter(ThreadPool *tpoolPtr);
-
-static void
-SignalWaiter(ThreadPool *tpoolPtr);
+static int
+ServiceEvent(Tcl_Event *eventPtr, int mask);
 
 static int
-TpoolEval(Tcl_Interp *interp, char *script, int scriptLen,
-                            TpoolResult *rPtr);
+WorkEvent(Tcl_Event *eventPtr, int mask);
+
 static void
+SignalWaiter(ThreadPool *tpoolPtr, Tcl_ThreadId threadId);
+
+static int
+TpoolEval(Tcl_Interp *interp, Tcl_Obj *script, TpoolResult *rPtr);
+static int
 SetResult(Tcl_Interp *interp, TpoolResult *rPtr);
+
+static ThreadPool*
+GetTpoolFromObj(Tcl_Interp *interp, Tcl_Obj *objPtr, int shutDownLevel);
 
 static ThreadPool*
 GetTpool(const char *tpoolName);
 
 static ThreadPool*
 GetTpoolUnl(const char *tpoolName);
-
-static void
-ThrExitHandler(ClientData clientData);
 
 static void
 AppExitHandler(ClientData clientData);
@@ -166,15 +208,175 @@ static int
 TpoolRelease(ThreadPool *tpoolPtr);
 
 static void
-TpoolSuspend(ThreadPool *tpoolPtr);
+TpoolSuspend(ThreadPool *tpoolPtr, int mode);
 
 static void
-TpoolResume(ThreadPool *tpoolPtr);
+TpoolResume(Tcl_Interp * interp, ThreadPool *tpoolPtr);
 
 static void
-InitWaiter(void);
+TpoolObj_DupInternalRep(Tcl_Obj *srcPtr, Tcl_Obj *copyPtr);
+static void
+TpoolObj_FreeInternalRep(Tcl_Obj *objPtr);
+static int
+TpoolObj_SetFromAny(Tcl_Interp *interp, Tcl_Obj *objPtr);
+static void
+TpoolObj_UpdateString(Tcl_Obj *objPtr);
+
+#define TpoolObj_SetObjIntRep(objPtr, tpoolPtr) \
+    objPtr->internalRep.twoPtrValue.ptr1 = tpoolPtr, \
+    objPtr->internalRep.twoPtrValue.ptr2 = NULL, \
+    objPtr->typePtr = &TpoolObjType;
+
+#define TPOOL_SVC_EVENT ((TpoolResult*)ServiceEvent)
+
+#define TPOOL_TSD_INIT() \
+  (TpoolSpecificData*)Tcl_GetThreadData((&dataKey),sizeof(TpoolSpecificData))
+
+
+#define DoubleToTime(tm, tmdbl) { \
+    tm.sec = (long)tmdbl; \
+    tm.usec = (long)((tmdbl - (long)tmdbl) * 1000000); \
+}
+#define TimeAddTime(tm, offs) { \
+    tm.sec += offs.sec; \
+    tm.usec += offs.usec; \
+    if (tm.usec >= 1000000) { tm.sec++; tm.usec -= 1000000;} \
+}
+#define TimeIsZero(tm)                 ((tm.sec | tm.usec) == 0)
+#define TimeIsNonZero(tm)              ((tm.sec | tm.usec) != 0)
+#define TimeLessOrEqual(tm, comptm)    (tm.sec < comptm.sec || (tm.sec == comptm.sec && tm.usec <= comptm.usec))
+#define TimeGreaterOrEqual(tm, comptm) (tm.sec > comptm.sec || (tm.sec == comptm.sec && tm.usec >= comptm.usec))
+
+/*
+ *----------------------------------------------------------------------
+ */
+static __forceinline void
+SignalWorkerInner(poolWrk, eventProc, rPtr, queuepos)
+    TpoolWorker *poolWrk;
+    Tcl_EventProc *eventProc;
+    TpoolResult *rPtr;
+    Tcl_QueuePosition queuepos;
+{
+    Tcl_Event   *evPtr;
+    TpoolEvent  *poolEvent;
+
+    evPtr = (Tcl_Event*)ckalloc(sizeof(Tcl_Event) + sizeof(TpoolEvent));
+    evPtr->proc = eventProc;
+    poolEvent = (TpoolEvent*)(evPtr+1);
+    poolEvent->poolWrk = poolWrk;
+    poolEvent->rPtr = rPtr;
+    Tcl_ThreadQueueEvent(poolWrk->threadId, evPtr, queuepos);
+    Tcl_ThreadAlert(poolWrk->threadId);
+}
 
 
+/*
+ *----------------------------------------------------------------------
+ *
+ * TpoolGetPoolArgs --
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+TpoolGetPoolArgs(tpoolPtr, interp, objc, objv, iiPtr)
+    ThreadPool *tpoolPtr;       /* Parsed arguments to create or reload pool */
+    Tcl_Interp *interp;         /* Current interpreter. */
+    int         objc;           /* Number of arguments. */
+    Tcl_Obj    *const objv[];   /* Argument objects. */
+    int        *iiPtr;          /* Index of current argument */
+{
+    int ii;
+    /*
+     * Syntax:  tpool::create|tpool::reload \
+     *                        ?-minworkers count?
+     *                        ?-maxworkers count?
+     *                        ?-initcmd script?
+     *                        ?-exitcmd script?
+     *                        ?-idletime sec.ms? ?-idlelatency sec.ms?
+     *                        ?-idlecmd script?
+     *                        ?-idleint script? ?-in sec.ms?
+     */
+
+    /*
+     * Parse the optional arguments
+     */
+
+    for (ii = *iiPtr; ii < objc; ii += 2, *iiPtr = ii) {
+        char *opt;
+        if (ii+1 >= objc) {
+            return TCL_BREAK;
+        }
+        opt = Tcl_GetString(objv[ii]);
+        if (OPT_CMP(opt, "-minworkers")) {
+            if (Tcl_GetIntFromObj(interp, objv[ii+1], &tpoolPtr->minWorkers) != TCL_OK) {
+                return TCL_ERROR;
+            }
+        } else if (OPT_CMP(opt, "-maxworkers")) {
+            if (Tcl_GetIntFromObj(interp, objv[ii+1], &tpoolPtr->maxWorkers) != TCL_OK) {
+                return TCL_ERROR;
+            }
+            if (tpoolPtr->minWorkers > tpoolPtr->maxWorkers)
+                tpoolPtr->minWorkers = tpoolPtr->maxWorkers;
+        } else if (OPT_CMP(opt, "-idletime")) {
+            double val;
+            if (Tcl_GetDoubleFromObj(interp, objv[ii+1], &val) != TCL_OK) {
+                return TCL_ERROR;
+            }
+            DoubleToTime(tpoolPtr->idleTime, val);
+        } else if (OPT_CMP(opt, "-initcmd")) {
+            tpoolPtr->initScript = objv[ii+1];
+        } else if (OPT_CMP(opt, "-exitcmd")) {
+            tpoolPtr->exitScript = objv[ii+1];
+        } else if (OPT_CMP(opt, "-discrete")) {
+            int flag;
+            if (Tcl_GetBooleanFromObj(interp, objv[ii+1], &flag) != TCL_OK) {
+                return TCL_ERROR;
+            }
+            if (flag)
+                tpoolPtr->flags |= TPOOL_FLAG_DISCRETE;
+            else
+                tpoolPtr->flags &= ~TPOOL_FLAG_DISCRETE;
+        } else if (OPT_CMP(opt, "-idlelatency")) {
+            double val;
+            if (Tcl_GetDoubleFromObj(interp, objv[ii+1], &val) != TCL_OK) {
+                return TCL_ERROR;
+            }
+            DoubleToTime(tpoolPtr->idleLatency, val);
+        } else if (OPT_CMP(opt, "-idlecmd")) {
+            tpoolPtr->idleScript = objv[ii+1];
+        } else if (OPT_CMP(opt, "-idleint")) {
+            tpoolPtr->idleIntScript = objv[ii+1];
+            if (ii + 2 < objc && OPT_CMP(Tcl_GetString(objv[ii+2]), "-in")) {
+                double val;
+                ii+=2;
+                if (Tcl_GetDoubleFromObj(interp, objv[ii+1], &val) != TCL_OK) {
+                    return TCL_ERROR;
+                }
+                DoubleToTime(tpoolPtr->idleIntTime, val);
+            }
+        } else {
+            return TCL_BREAK;
+        }
+    }
+
+    /*
+     * Do some consistency checking
+     */
+
+    if (tpoolPtr->minWorkers < 0) {
+        tpoolPtr->minWorkers = 0;
+    }
+    if (tpoolPtr->maxWorkers < 0) {
+        tpoolPtr->maxWorkers = TPOOL_MAXWORKERS;
+    }
+    if (tpoolPtr->minWorkers > tpoolPtr->maxWorkers) {
+        tpoolPtr->maxWorkers = tpoolPtr->minWorkers;
+    }
+
+    return TCL_OK;
+}
+
 /*
  *----------------------------------------------------------------------
  *
@@ -199,68 +401,19 @@ TpoolCreateObjCmd(dummy, interp, objc, objv)
     int         objc;           /* Number of arguments. */
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
-    int ii, minw, maxw, idle;
-    char buf[64], *exs = NULL, *cmd = NULL;
+    int ii, ret;
     ThreadPool *tpoolPtr;
+    Tcl_Obj    *objPtr;
 
     /*
      * Syntax:  tpool::create ?-minworkers count?
      *                        ?-maxworkers count?
      *                        ?-initcmd script?
      *                        ?-exitcmd script?
-     *                        ?-idletime seconds?
+     *                        ?-idletime sec.ms? ?-idlelatency sec.ms?
+     *                        ?-idlecmd script?
+     *                        ?-idleint script? ?-in sec.ms?
      */
-
-    if (((objc-1) % 2)) {
-        goto usage;
-    }
-
-    minw = TPOOL_MINWORKERS;
-    maxw = TPOOL_MAXWORKERS;
-    idle = TPOOL_IDLETIMER;
-
-    /*
-     * Parse the optional arguments
-     */
-
-    for (ii = 1; ii < objc; ii += 2) {
-        char *opt = Tcl_GetString(objv[ii]);
-        if (OPT_CMP(opt, "-minworkers")) {
-            if (Tcl_GetIntFromObj(interp, objv[ii+1], &minw) != TCL_OK) {
-                return TCL_ERROR;
-            }
-        } else if (OPT_CMP(opt, "-maxworkers")) {
-            if (Tcl_GetIntFromObj(interp, objv[ii+1], &maxw) != TCL_OK) {
-                return TCL_ERROR;
-            }
-        } else if (OPT_CMP(opt, "-idletime")) {
-            if (Tcl_GetIntFromObj(interp, objv[ii+1], &idle) != TCL_OK) {
-                return TCL_ERROR;
-            }
-        } else if (OPT_CMP(opt, "-initcmd")) {
-            const char *val = Tcl_GetString(objv[ii+1]);
-            cmd  = strcpy(ckalloc(objv[ii+1]->length+1), val);
-        } else if (OPT_CMP(opt, "-exitcmd")) {
-            const char *val = Tcl_GetString(objv[ii+1]);
-            exs  = strcpy(ckalloc(objv[ii+1]->length+1), val);
-        } else {
-            goto usage;
-        }
-    }
-
-    /*
-     * Do some consistency checking
-     */
-
-    if (minw < 0) {
-        minw = 0;
-    }
-    if (maxw < 0) {
-        maxw = TPOOL_MAXWORKERS;
-    }
-    if (minw > maxw) {
-        maxw = minw;
-    }
 
     /*
      * Allocate and initialize thread pool structure
@@ -269,15 +422,39 @@ TpoolCreateObjCmd(dummy, interp, objc, objv)
     tpoolPtr = (ThreadPool*)ckalloc(sizeof(ThreadPool));
     memset(tpoolPtr, 0, sizeof(ThreadPool));
 
-    tpoolPtr->minWorkers  = minw;
-    tpoolPtr->maxWorkers  = maxw;
-    tpoolPtr->idleTime    = idle;
-    tpoolPtr->initScript  = cmd;
-    tpoolPtr->exitScript  = exs;
+    /* default arguments */
+    tpoolPtr->minWorkers = TPOOL_MINWORKERS;
+    tpoolPtr->maxWorkers = TPOOL_MAXWORKERS;
+    DoubleToTime(tpoolPtr->idleTime, TPOOL_IDLETIMER);
+    DoubleToTime(tpoolPtr->idleLatency, TPOOL_IDLELATENCY);
+    DoubleToTime(tpoolPtr->idleIntTime, TPOOL_IDLEINT);
+    tpoolPtr->flags = TPOOL_FLAGS;
+
+    /*
+     * Parse the optional arguments
+     */
+
+    ii = 1;
+    ret = TpoolGetPoolArgs(tpoolPtr, interp, objc, objv, &ii);
+    if (ret != TCL_OK) {
+        ckfree((char*)tpoolPtr);
+        if (ret == TCL_BREAK)
+            goto usage;
+        return TCL_ERROR;
+    }
+
+    /* duplicate objects to use its content thread safe in other threads */
+    tpoolPtr->initScript    = Sv_DupIncrObj(tpoolPtr->initScript);
+    tpoolPtr->exitScript    = Sv_DupIncrObj(tpoolPtr->exitScript);
+    tpoolPtr->idleScript    = Sv_DupIncrObj(tpoolPtr->idleScript);
+    tpoolPtr->idleIntScript = Sv_DupIncrObj(tpoolPtr->idleIntScript);
+
     Tcl_InitHashTable(&tpoolPtr->jobsDone, TCL_ONE_WORD_KEYS);
 
     Tcl_MutexLock(&listMutex);
     SpliceIn(tpoolPtr, tpoolList);
+    tpoolPtr->objRefCount++;
+    tpoolPtr->refCount++;
     Tcl_MutexUnlock(&listMutex);
 
     /*
@@ -288,9 +465,12 @@ TpoolCreateObjCmd(dummy, interp, objc, objv)
 
     Tcl_MutexLock(&tpoolPtr->mutex);
     for (ii = 0; ii < tpoolPtr->minWorkers; ii++) {
-        if (CreateWorker(interp, tpoolPtr) != TCL_OK) {
+        if (CreateWorker(interp, tpoolPtr, 1) != TCL_OK) {
+            _log_debug(" !!! pool master: failed to create worker ");
             Tcl_MutexUnlock(&tpoolPtr->mutex);
             Tcl_MutexLock(&listMutex);
+            tpoolPtr->objRefCount--;
+            _log_debug(" !!! pool master: release ... %d/%d ", tpoolPtr->objRefCount, tpoolPtr->refCount);
             TpoolRelease(tpoolPtr);
             Tcl_MutexUnlock(&listMutex);
             return TCL_ERROR;
@@ -298,8 +478,11 @@ TpoolCreateObjCmd(dummy, interp, objc, objv)
     }
     Tcl_MutexUnlock(&tpoolPtr->mutex);
 
-    sprintf(buf, "%s%p", TPOOL_HNDLPREFIX, tpoolPtr);
-    Tcl_SetObjResult(interp, Tcl_NewStringObj(buf, -1));
+
+    objPtr = Tcl_NewObj();
+    objPtr->bytes = NULL;
+    TpoolObj_SetObjIntRep(objPtr, tpoolPtr);
+    Tcl_SetObjResult(interp, objPtr);
 
     return TCL_OK;
 
@@ -307,8 +490,227 @@ TpoolCreateObjCmd(dummy, interp, objc, objv)
     Tcl_WrongNumArgs(interp, 1, objv,
                      "?-minworkers count? ?-maxworkers count? "
                      "?-initcmd script? ?-exitcmd script? "
-                     "?-idletime seconds?");
+                     "?-discrete 0|1? "
+                     "?-idletime sec.ms? ?-idlelatency sec.ms? "
+                     "?-idlecmd script? "
+                     "?-idleint script? ?-in sec.ms?"
+    );
     return TCL_ERROR;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * TpoolReloadObjCmd -- , tpool::reload --
+ *
+ *  This command will be used to reload pool.
+ *  See the user documentation for details on what it does.
+ *
+ * Results:
+ *  A standard Tcl result.
+ *
+ * Side effects:
+ *  None.
+ *
+ *----------------------------------------------------------------------
+ */
+
+static int
+TpoolReloadObjCmd(dummy, interp, objc, objv)
+    ClientData  dummy;          /* Not used. */
+    Tcl_Interp *interp;         /* Current interpreter. */
+    int         objc;           /* Number of arguments. */
+    Tcl_Obj    *const objv[];   /* Argument objects. */
+{
+    int ii, ret, suspended;
+    Tcl_Obj *reloadScript = NULL;
+    ThreadPool *tpoolPtr, tpoolArgs;
+
+    /*
+     * Syntax:  tpool::reload tpoolId ?-minworkers count?
+     *                        ?-maxworkers count?
+     *                        ?-initcmd script?
+     *                        ?-exitcmd script?
+     *                        ?-idletime sec.ms? ?-idlelatency sec.ms?
+     *                        ?-idlecmd script?
+     *                        ?-idleint script? ?-in sec.ms?
+     *                        ?reload-script?
+     */
+
+    if (objc <= 1) {
+        goto usage;
+    }
+
+    /*
+     * Find given pool
+     */
+
+    if ((tpoolPtr = GetTpoolFromObj(interp, objv[1], 0)) == NULL) {
+        return TCL_ERROR;
+    }
+
+    /* default arguments */
+    memcpy(&tpoolArgs, tpoolPtr, sizeof(ThreadPool));
+
+    /*
+     * Parse the optional arguments
+     */
+
+    ii = 2;
+    ret = TpoolGetPoolArgs(&tpoolArgs, interp, objc, objv, &ii);
+    if (ret != TCL_OK) {
+        if (ret == TCL_BREAK) {
+            /* if not the last parameter (not reload-script) */
+            if (ii != objc-1) {
+              goto usage;
+            }
+            reloadScript = objv[ii];
+        } else {
+            return TCL_ERROR;
+        }
+    }
+
+    /* temporarely suspend all workers (if not already) */
+    if (!(suspended = tpoolPtr->suspend)) {
+      TpoolSuspend(tpoolPtr, TPOOL_SUSPEND_JOBS);
+    }
+
+    Tcl_MutexLock(&tpoolPtr->mutex);
+
+    /* easy update static parameters */
+    tpoolPtr->minWorkers  = tpoolArgs.minWorkers;
+    tpoolPtr->maxWorkers  = tpoolArgs.maxWorkers;
+    tpoolPtr->idleTime    = tpoolArgs.idleTime;
+    tpoolPtr->idleLatency = tpoolArgs.idleLatency;
+    tpoolPtr->idleIntTime = tpoolArgs.idleIntTime;
+    tpoolPtr->flags       = tpoolArgs.flags;
+
+    /* switch (to duplicate of) objects to use its content thread safe in other threads */
+    Sv_SetDupObj(&tpoolPtr->initScript,    tpoolArgs.initScript);
+    Sv_SetDupObj(&tpoolPtr->exitScript,    tpoolArgs.exitScript);
+    Sv_SetDupObj(&tpoolPtr->idleScript,    tpoolArgs.idleScript);
+    Sv_SetDupObj(&tpoolPtr->idleIntScript, tpoolArgs.idleIntScript);
+
+    /*
+     * notify all workers using distributed job - we have reloaded pool, 
+     * release some if exceed new maxWorkers.
+     */
+    if (tpoolPtr->workerRing) {
+        int count = tpoolPtr->maxWorkers;
+        TpoolWorker *poolWrk, *lastHead;
+        poolWrk = lastHead = tpoolPtr->workerRing;
+        do {
+            if (--count >= 0) {
+                SignalWorkerInner(poolWrk, TpoolReloadEvent, 
+                    (TpoolResult*)(reloadScript ? Sv_DuplicateObj(reloadScript) : NULL), 
+                    TCL_QUEUE_HEAD);
+            } else {
+                ThreadReserve(NULL, poolWrk->threadId, NULL, THREAD_RELEASE, 0);
+            }
+            poolWrk = poolWrk->nextWrk;
+
+        } while (poolWrk != lastHead);
+    };
+
+    Tcl_MutexUnlock(&tpoolPtr->mutex);
+
+    if (!suspended) {
+        /* resume pool, notify workers and start new workers if some needed (numWorkers < minWorkers) */
+        TpoolResume(interp, tpoolPtr);
+    }
+
+    return TCL_OK;
+
+ usage:
+    Tcl_WrongNumArgs(interp, 1, objv, "tpoolId "
+                     "?-minworkers count? ?-maxworkers count? "
+                     "?-initcmd script? ?-exitcmd script? "
+                     "?-discrete 0|1? "
+                     "?-idletime sec.ms? ?-idlelatency sec.ms? "
+                     "?-idlecmd script? "
+                     "?-idleint script? ?-in sec.ms?"
+                     "?reload-script?"
+    );
+
+    return TCL_ERROR;
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * SignalWorker --
+ *
+ *  Notify (wake up) the pool threads waiting in Tcl_DoOneEvent.
+ *
+ *  Pool mutex should be locked.
+ *
+ *  count - if positive count of worker to be signaled, 
+ *          if negative count of idle to be signaled
+ *  rPtr  - if TPOOL_SVC_EVENT - simple service event (wakeup)
+ *          if not NULL - work event with distributed job, 
+ *          otherwise - work event - get job from queue.
+ *
+ * [ToDo]:
+ *  Replace this function if tcl will support something like 
+ *  WaitForMultipleObjects in Tcl_DoOneEvent.
+ *
+ * Results:
+ *  None.
+ *
+ *----------------------------------------------------------------------
+ */
+static void
+SignalWorker(tpoolPtr, count, rPtr, queuepos)
+    ThreadPool  *tpoolPtr;
+    int          count;
+    TpoolResult *rPtr;
+    Tcl_QueuePosition queuepos;
+{
+    TpoolWorker *poolWrk, *lastHead;
+    int          wrk = 0;
+
+    /* go over ring to signal, prefer idle workers if expected */
+    poolWrk = NULL;
+    if (count < 0) {
+        poolWrk = lastHead = tpoolPtr->idleRing;
+        count = -count;
+        if (poolWrk == NULL && (rPtr != NULL && rPtr != TPOOL_SVC_EVENT)) {
+            wrk = 1;
+            poolWrk = lastHead = tpoolPtr->workerRing;
+        }
+    } else {
+        wrk = 1;
+        poolWrk = lastHead = tpoolPtr->workerRing;
+    }
+    if (poolWrk == NULL) {
+        return;
+    }
+    while (count) {
+        _log_debug(" !!! pool master: signal %s [%04X] ... ", (wrk?"worker":"idle"), poolWrk->threadId);
+        if (rPtr != TPOOL_SVC_EVENT) {
+            SignalWorkerInner(poolWrk, WorkEvent, rPtr, queuepos);
+            rPtr = NULL;
+        } else {
+            SignalWorkerInner(poolWrk, ServiceEvent, rPtr, queuepos);
+        }
+
+        if (wrk) {
+            poolWrk = poolWrk->nextWrk;
+        } else {
+            poolWrk = poolWrk->nextIdl;
+        }
+        count--;
+        if (poolWrk == lastHead) {
+            break;
+        }
+    }
+    /* move ring head pointer to last known (to notify later another worker) */
+    if (!wrk) {
+        tpoolPtr->idleRing = poolWrk;
+    }
+    /* always move ring head after last processed */
+    tpoolPtr->workerRing = poolWrk;
+    _log_debug(" !!! pool master: rings ... [%04X] ", poolWrk->threadId);
 }
 
 /*
@@ -336,74 +738,80 @@ TpoolPostObjCmd(dummy, interp, objc, objv)
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
     Tcl_WideInt jobId = 0;
-    int ii, detached = 0, nowait = 0;
+    int ii, detached = 0, nostart = 0, distribute = 0, broadcast = 0;
+    Tcl_QueuePosition queuepos = TCL_QUEUE_TAIL;
     size_t len;
-    const char *tpoolName, *script;
+    Tcl_Obj  *script;
     TpoolResult *rPtr;
-    ThreadPool *tpoolPtr;
+    ThreadPool  *tpoolPtr;
+    Tcl_Obj *retJobs = NULL; int retCode = TCL_OK;
 
-    ThreadSpecificData *tsdPtr = TCL_TSD_INIT(&dataKey);
+    TpoolSpecificData *tsdPtr = TPOOL_TSD_INIT();
 
     /*
-     * Syntax: tpool::post ?-detached? ?-nowait? tpoolId script
+     * Syntax: tpool::post ?-async|-detached? ?-nostart|-nowait? ?-distribute? ?-head? ?-broadcast ?count|-1?? tpoolId script
+     *         -nowait is an alias for -nostart for backwards compatibility.
      */
 
-    if (objc < 3 || objc > 5) {
+    if (objc < 3) {
         goto usage;
     }
     for (ii = 1; ii < objc; ii++) {
         char *opt = Tcl_GetString(objv[ii]);
         if (*opt != '-') {
             break;
-        } else if (OPT_CMP(opt, "-detached")) {
+        } else if (OPT_CMP(opt, "-async") || OPT_CMP(opt, "-detached")) {
             detached  = 1;
-        } else if (OPT_CMP(opt, "-nowait")) {
-            nowait = 1;
+        } else if (OPT_CMP(opt, "-nostart") || OPT_CMP(opt, "-nowait")) {
+            nostart = 1;
+        } else if (OPT_CMP(opt, "-distribute")) {
+            distribute = 1;
+        } else if (OPT_CMP(opt, "-broadcast")) {
+            broadcast = -1;
+            if (ii+1 + 2 < objc) {
+                if (Tcl_GetIntFromObj(NULL, objv[ii+1], &broadcast) != TCL_OK) {
+                    return TCL_ERROR;
+                }
+                ii++;
+            }
+        } else if (OPT_CMP(opt, "-head")) {
+            queuepos = TCL_QUEUE_HEAD;
         } else {
             goto usage;
         }
     }
 
-    /*
-     * We expect exactly two arguments remaining after options
-     */
-    if (objc - ii != 2)
-    {
-        goto usage;
-    }
-
-    tpoolName = Tcl_GetString(objv[ii]);
-    script    = Tcl_GetString(objv[ii+1]);
-    len = objv[ii+1]->length;
-    tpoolPtr  = GetTpool(tpoolName);
-    if (tpoolPtr == NULL) {
-        Tcl_AppendResult(interp, "can not find threadpool \"", tpoolName,
-                         "\"", NULL);
+    if ((tpoolPtr = GetTpoolFromObj(interp, objv[ii], 0)) == NULL) {
         return TCL_ERROR;
     }
-
-    /*
-     * Initialize per-thread private data for this caller
-     */
-
-    InitWaiter();
+    script = objv[ii+1];
+    len = objv[ii+1]->length;
 
     /*
      * See if any worker available to run the job.
      */
+    _log_debug(" !!! pool master: new job ...");
 
     Tcl_MutexLock(&tpoolPtr->mutex);
-    if (nowait) {
+
+    if (tpoolPtr->tearDown || tpoolPtr->refCount <= 0) {
+        if (interp) {
+            Tcl_AppendResult(interp, "threadpool is shut down", NULL);
+            Tcl_SetErrorCode(interp, "TCL", "ESHUTDOWN", NULL);
+        }
+        goto done;
+    }
+
+    if (nostart) {
         if (tpoolPtr->numWorkers == 0) {
 
             /*
              * Assure there is at least one worker running.
              */
 
-            PushWaiter(tpoolPtr);
-            if (CreateWorker(interp, tpoolPtr) != TCL_OK) {
-                Tcl_MutexUnlock(&tpoolPtr->mutex);
-                return TCL_ERROR;
+            if (CreateWorker(interp, tpoolPtr, 1) != TCL_OK) {
+                retCode = TCL_ERROR;
+                goto done;
             }
 
             /*
@@ -413,30 +821,31 @@ TpoolPostObjCmd(dummy, interp, objc, objv)
             Tcl_MutexUnlock(&tpoolPtr->mutex);
             tsdPtr->stop = -1;
             while(tsdPtr->stop == -1) {
-                Tcl_DoOneEvent(TCL_ALL_EVENTS);
+                Tcl_DoOneEvent((TCL_ALL_EVENTS & ~TCL_IDLE_EVENTS));
             }
             Tcl_MutexLock(&tpoolPtr->mutex);
         }
-    } else {
+    }
+    else 
+    while (tpoolPtr->numWorkers < tpoolPtr->maxWorkers) {
 
         /*
          * If there are no idle worker threads, start some new
          * unless we are already running max number of workers.
-         * In that case wait for the next one to become idle.
+         * Don't wait for the next one to become idle, because
+         * we are event-driven now, and can notify workers also 
+         * using ring for distribution.
          */
 
-        while (tpoolPtr->idleWorkers == 0) {
-            PushWaiter(tpoolPtr);
-            if (tpoolPtr->numWorkers < tpoolPtr->maxWorkers) {
+        if (tpoolPtr->idleWorkers == 0 || broadcast) {
 
-                /*
-                 * No more free workers; start new one
-                 */
+            /*
+             * No more free workers; start new one
+             */
 
-                if (CreateWorker(interp, tpoolPtr) != TCL_OK) {
-                    Tcl_MutexUnlock(&tpoolPtr->mutex);
-                    return TCL_ERROR;
-                }
+            if (CreateWorker(interp, tpoolPtr, 1) != TCL_OK) {
+                retCode = TCL_ERROR;
+                goto done;
             }
 
             /*
@@ -446,41 +855,104 @@ TpoolPostObjCmd(dummy, interp, objc, objv)
             Tcl_MutexUnlock(&tpoolPtr->mutex);
             tsdPtr->stop = -1;
             while(tsdPtr->stop == -1) {
-                Tcl_DoOneEvent(TCL_ALL_EVENTS);
+                Tcl_DoOneEvent((TCL_ALL_EVENTS & ~TCL_IDLE_EVENTS));
             }
             Tcl_MutexLock(&tpoolPtr->mutex);
         }
+
+        if (!broadcast) 
+            break;
+    }
+
+    if (tpoolPtr->tearDown || tpoolPtr->refCount <= 0) {
+        if (interp) {
+            Tcl_AppendResult(interp, "threadpool is shut down", NULL);
+            Tcl_SetErrorCode(interp, "TCL", "ESHUTDOWN", NULL);
+        }
+        goto done;
     }
 
     /*
      * Create new job ticket and put it on the list.
+     * If broadcast repeat it (given count or numWorkers times),
+     * do all this during mutex locked.
      */
+    if (broadcast <= -1)
+        broadcast = tpoolPtr->numWorkers;
 
-    rPtr = (TpoolResult*)ckalloc(sizeof(TpoolResult));
-    memset(rPtr, 0, sizeof(TpoolResult));
+    do {
 
-    if (detached == 0) {
-        jobId = ++tpoolPtr->jobId;
+        rPtr = (TpoolResult*)ckalloc(sizeof(TpoolResult));
+
+        if (detached == 0) {
+            jobId = ++tpoolPtr->jobId;
+        }
         rPtr->jobId = jobId;
-    }
+        rPtr->script    = Sv_DupIncrObj(script);
+        rPtr->detached  = detached;
+        rPtr->threadId  = Tcl_GetCurrentThread();
+        rPtr->tpoolPtr  = tpoolPtr;
+        rPtr->resultObj = NULL;
+        rPtr->nextPtr   = 
+        rPtr->prevPtr   = NULL;
 
-    rPtr->script    = strcpy(ckalloc(len+1), script);
-    rPtr->scriptLen = len;
-    rPtr->detached  = detached;
-    rPtr->threadId  = Tcl_GetCurrentThread();
+        _log_debug(" !!! pool master: job ... %p, %d/%d/%d, [%04X]/[%04X] ", rPtr, 
+            tpoolPtr->idleWorkers, tpoolPtr->numWorkers, tpoolPtr->stopWorkers,
+            tpoolPtr->idleRing?tpoolPtr->idleRing->threadId:0,
+            tpoolPtr->workerRing?tpoolPtr->workerRing->threadId:0);
 
-    PushWork(rPtr, tpoolPtr);
-    Tcl_ConditionNotify(&tpoolPtr->cond);
+        if (!distribute) {
+            /* add job to queue */
+            PushWork(rPtr, tpoolPtr);
+            /* 
+             * wake resp. notify idle worker (because not idle workers will wake itself 
+             * later if jobs still available), in broadcast do this only last numWorkers times
+             */
+            if (!tpoolPtr->suspend && tpoolPtr->idleWorkers 
+             && (broadcast <= tpoolPtr->numWorkers)
+            ) {
+                SignalWorker(tpoolPtr, -1, NULL, queuepos);
+            }
+        } else {
+            /* distribute - send job to first worker directly, that will distribute
+             * over all workers, because it moves a ring head to next one */
+            SignalWorker(tpoolPtr, 1, rPtr, queuepos);
+        }
+
+        if (detached == 0) {
+            /* prepare jobid(s) for return to interp */
+            if (!broadcast) {
+                retJobs = Tcl_NewWideIntObj(jobId);
+            } else {
+                if (retJobs == NULL) {
+                    retJobs = Tcl_NewWideIntObj(jobId);
+                    retJobs = Tcl_NewListObj(1, &retJobs);
+                } else {
+                    if (Tcl_ListObjAppendElement(interp, retJobs, 
+                            Tcl_NewWideIntObj(jobId)) != TCL_OK) {
+                        Tcl_DecrRefCount(retJobs); 
+                        retJobs = NULL, retCode = TCL_ERROR; 
+                        goto done;
+                    }
+                }
+            }
+        }
+
+    } while (--broadcast > 0);
+
+done:
     Tcl_MutexUnlock(&tpoolPtr->mutex);
 
-    if (detached == 0) {
-        Tcl_SetObjResult(interp, Tcl_NewWideIntObj(jobId));
+    if (retJobs != NULL) {
+        Tcl_SetObjResult(interp, retJobs);
     }
-
-    return TCL_OK;
+    return retCode;
 
   usage:
-    Tcl_WrongNumArgs(interp, 1, objv, "?-detached? ?-nowait? tpoolId script");
+    Tcl_WrongNumArgs(interp, 1, objv, "?-async|-detached? ?-nostart|-nowait?"
+        " ?-distribute? ?-head? ?-broadcast ?count|-1??"
+        " tpoolId script"
+    );
     return TCL_ERROR;
 }
 
@@ -507,16 +979,15 @@ TpoolWaitObjCmd(dummy, interp, objc, objv)
     int         objc;           /* Number of arguments. */
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
-    int ii, done, wObjc;
+    int ii, done, wObjc, retCode = TCL_OK;
     Tcl_WideInt jobId;
-    char *tpoolName;
     Tcl_Obj *listVar = NULL;
-    Tcl_Obj *waitList, *doneList, **wObjv;
+    Tcl_Obj *waitList = NULL, *doneList, **wObjv;
     ThreadPool *tpoolPtr;
     TpoolResult *rPtr;
     Tcl_HashEntry *hPtr;
 
-    ThreadSpecificData *tsdPtr = TCL_TSD_INIT(&dataKey);
+    TpoolSpecificData *tsdPtr = TPOOL_TSD_INIT();
 
     /*
      * Syntax: tpool::wait tpoolId jobIdList ?listVar?
@@ -532,25 +1003,27 @@ TpoolWaitObjCmd(dummy, interp, objc, objv)
     if (Tcl_ListObjGetElements(interp, objv[2], &wObjc, &wObjv) != TCL_OK) {
         return TCL_ERROR;
     }
-    tpoolName = Tcl_GetString(objv[1]);
-    tpoolPtr  = GetTpool(tpoolName);
-    if (tpoolPtr == NULL) {
-        Tcl_AppendResult(interp, "can not find threadpool \"", tpoolName,
-                         "\"", NULL);
+    if ((tpoolPtr = GetTpoolFromObj(interp, objv[1], 1)) == NULL) {
         return TCL_ERROR;
     }
 
-    InitWaiter();
     done = 0; /* Number of elements in the done list */
     doneList = Tcl_NewListObj(0, NULL);
 
     Tcl_MutexLock(&tpoolPtr->mutex);
     while (1) {
-        waitList = Tcl_NewListObj(0, NULL);
+        if (tpoolPtr->tearDown > 1) {
+            Tcl_AppendResult(interp, "threadpool is shut down", NULL);
+            Tcl_SetErrorCode(interp, "TCL", "ESHUTDOWN", NULL);
+            retCode = TCL_ERROR;
+            goto end;
+        }
+        if (listVar)
+            waitList = Tcl_NewListObj(0, NULL);
         for (ii = 0; ii < wObjc; ii++) {
             if (Tcl_GetWideIntFromObj(interp, wObjv[ii], &jobId) != TCL_OK) {
-                Tcl_MutexUnlock(&tpoolPtr->mutex);
-                return TCL_ERROR;
+                retCode = TCL_ERROR;
+                goto end;
             }
             hPtr = Tcl_FindHashEntry(&tpoolPtr->jobsDone, (void *)(size_t)jobId);
             if (hPtr) {
@@ -562,7 +1035,7 @@ TpoolWaitObjCmd(dummy, interp, objc, objv)
                 if (listVar) {
                     Tcl_ListObjAppendElement(interp, waitList, wObjv[ii]);
                 }
-            } else if (!rPtr->detached && rPtr->result) {
+            } else if (!rPtr->detached && rPtr->resultObj) {
                 done++;
                 Tcl_ListObjAppendElement(interp, doneList, wObjv[ii]);
             } else if (listVar) {
@@ -578,8 +1051,9 @@ TpoolWaitObjCmd(dummy, interp, objc, objv)
          * of the next job and try again.
          */
 
-        Tcl_DecrRefCount(waitList);
-        PushWaiter(tpoolPtr);
+        if (waitList) {
+            Tcl_DecrRefCount(waitList); waitList = NULL;
+        }
 
         Tcl_MutexUnlock(&tpoolPtr->mutex);
         tsdPtr->stop = -1;
@@ -588,10 +1062,18 @@ TpoolWaitObjCmd(dummy, interp, objc, objv)
         }
         Tcl_MutexLock(&tpoolPtr->mutex);
     }
+
+end:
+
     Tcl_MutexUnlock(&tpoolPtr->mutex);
 
-    if (listVar) {
+    if (listVar && waitList) {
         Tcl_ObjSetVar2(interp, listVar, NULL, waitList, 0);
+    }
+
+    if (retCode != TCL_OK) {
+        Tcl_DecrRefCount(doneList);
+        return retCode;
     }
 
     Tcl_SetObjResult(interp, doneList);
@@ -622,11 +1104,10 @@ TpoolCancelObjCmd(dummy, interp, objc, objv)
     int         objc;           /* Number of arguments. */
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
-    int ii, wObjc;
+    int ii, wObjc, retCode = TCL_OK;
     Tcl_WideInt jobId;
-    char *tpoolName;
     Tcl_Obj *listVar = NULL;
-    Tcl_Obj *doneList, *waitList, **wObjv;
+    Tcl_Obj *doneList, *waitList = NULL, **wObjv;
     ThreadPool *tpoolPtr;
     TpoolResult *rPtr;
 
@@ -644,22 +1125,22 @@ TpoolCancelObjCmd(dummy, interp, objc, objv)
     if (Tcl_ListObjGetElements(interp, objv[2], &wObjc, &wObjv) != TCL_OK) {
         return TCL_ERROR;
     }
-    tpoolName = Tcl_GetString(objv[1]);
-    tpoolPtr  = GetTpool(tpoolName);
-    if (tpoolPtr == NULL) {
-        Tcl_AppendResult(interp, "can not find threadpool \"", tpoolName,
-                         "\"", NULL);
+    if ((tpoolPtr = GetTpoolFromObj(interp, objv[1], 1)) == NULL) {
         return TCL_ERROR;
     }
 
-    InitWaiter();
     doneList = Tcl_NewListObj(0, NULL);
-    waitList = Tcl_NewListObj(0, NULL);
+    if (listVar)
+        waitList = Tcl_NewListObj(0, NULL);
 
     Tcl_MutexLock(&tpoolPtr->mutex);
+    if (tpoolPtr->tearDown > 1) {
+        goto end;
+    }
     for (ii = 0; ii < wObjc; ii++) {
         if (Tcl_GetWideIntFromObj(interp, wObjv[ii], &jobId) != TCL_OK) {
-            return TCL_ERROR;
+            retCode = TCL_ERROR;
+            goto end;
         }
         for (rPtr = tpoolPtr->workHead; rPtr; rPtr = rPtr->nextPtr) {
             if (rPtr->jobId == jobId) {
@@ -674,7 +1155,7 @@ TpoolCancelObjCmd(dummy, interp, objc, objv)
                     tpoolPtr->workTail = rPtr->prevPtr;
                 }
                 SetResult(NULL, rPtr); /* Just to free the result */
-                ckfree(rPtr->script);
+                Tcl_DecrRefCount(rPtr->script);
                 ckfree((char*)rPtr);
                 Tcl_ListObjAppendElement(interp, doneList, wObjv[ii]);
                 break;
@@ -684,10 +1165,17 @@ TpoolCancelObjCmd(dummy, interp, objc, objv)
             Tcl_ListObjAppendElement(interp, waitList, wObjv[ii]);
         }
     }
+
+end:
+
     Tcl_MutexUnlock(&tpoolPtr->mutex);
 
-    if (listVar) {
+    if (listVar && waitList)
         Tcl_ObjSetVar2(interp, listVar, NULL, waitList, 0);
+
+    if (retCode != TCL_OK) {
+        Tcl_DecrRefCount(doneList);
+        return retCode;
     }
 
     Tcl_SetObjResult(interp, doneList);
@@ -718,13 +1206,12 @@ TpoolGetObjCmd(dummy, interp, objc, objv)
     int         objc;           /* Number of arguments. */
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
-    int ret;
+    int ret = TCL_OK;
     Tcl_WideInt jobId;
-    char *tpoolName;
     Tcl_Obj *resVar = NULL;
     ThreadPool *tpoolPtr;
     TpoolResult *rPtr;
-    Tcl_HashEntry *hPtr;
+    Tcl_HashEntry *hPtr = NULL;
 
     /*
      * Syntax: tpool::get tpoolId jobId ?result?
@@ -745,11 +1232,7 @@ TpoolGetObjCmd(dummy, interp, objc, objv)
      * Locate the threadpool
      */
 
-    tpoolName = Tcl_GetString(objv[1]);
-    tpoolPtr  = GetTpool(tpoolName);
-    if (tpoolPtr == NULL) {
-        Tcl_AppendResult(interp, "can not find threadpool \"", tpoolName,
-                         "\"", NULL);
+    if ((tpoolPtr = GetTpoolFromObj(interp, objv[1], 1)) == NULL) {
         return TCL_ERROR;
     }
 
@@ -760,24 +1243,32 @@ TpoolGetObjCmd(dummy, interp, objc, objv)
      */
 
     Tcl_MutexLock(&tpoolPtr->mutex);
-    hPtr = Tcl_FindHashEntry(&tpoolPtr->jobsDone, (void *)(size_t)jobId);
+    if (tpoolPtr->tearDown <= 1) {
+        hPtr = Tcl_FindHashEntry(&tpoolPtr->jobsDone, (void *)(size_t)jobId);
+    }
     if (hPtr == NULL) {
-        Tcl_MutexUnlock(&tpoolPtr->mutex);
         Tcl_AppendResult(interp, "no such job", NULL);
-        return TCL_ERROR;
+        ret = TCL_ERROR;
+        goto done;
     }
     rPtr = (TpoolResult*)Tcl_GetHashValue(hPtr);
-    if (rPtr->result == NULL) {
-        Tcl_MutexUnlock(&tpoolPtr->mutex);
+    if (rPtr->resultObj == NULL) {
         Tcl_AppendResult(interp, "job not completed", NULL);
-        return TCL_ERROR;
+        ret = TCL_ERROR;
+        goto done;
     }
 
+    /* completed / retrieved - delete entry */
     Tcl_DeleteHashEntry(hPtr);
+
+done:
+
     Tcl_MutexUnlock(&tpoolPtr->mutex);
 
-    ret = rPtr->retcode;
-    SetResult(interp, rPtr);
+    if (ret != TCL_OK)
+        return ret;
+
+    ret = SetResult(interp, rPtr);
     ckfree((char*)rPtr);
 
     if (resVar) {
@@ -814,7 +1305,6 @@ TpoolReserveObjCmd(dummy, interp, objc, objv)
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
     int ret;
-    char *tpoolName;
     ThreadPool *tpoolPtr;
 
     /*
@@ -826,17 +1316,11 @@ TpoolReserveObjCmd(dummy, interp, objc, objv)
         return TCL_ERROR;
     }
 
-    tpoolName = Tcl_GetString(objv[1]);
-
-    Tcl_MutexLock(&listMutex);
-    tpoolPtr  = GetTpoolUnl(tpoolName);
-    if (tpoolPtr == NULL) {
-        Tcl_MutexUnlock(&listMutex);
-        Tcl_AppendResult(interp, "can not find threadpool \"", tpoolName,
-                         "\"", NULL);
+    if ((tpoolPtr = GetTpoolFromObj(interp, objv[1], 0)) == NULL) {
         return TCL_ERROR;
     }
 
+    Tcl_MutexLock(&listMutex);
     ret = TpoolReserve(tpoolPtr);
     Tcl_MutexUnlock(&listMutex);
     Tcl_SetObjResult(interp, Tcl_NewIntObj(ret));
@@ -869,7 +1353,6 @@ TpoolReleaseObjCmd(dummy, interp, objc, objv)
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
     int ret;
-    char *tpoolName;
     ThreadPool *tpoolPtr;
 
     /*
@@ -881,19 +1364,18 @@ TpoolReleaseObjCmd(dummy, interp, objc, objv)
         return TCL_ERROR;
     }
 
-    tpoolName = Tcl_GetString(objv[1]);
-
-    Tcl_MutexLock(&listMutex);
-    tpoolPtr  = GetTpoolUnl(tpoolName);
-    if (tpoolPtr == NULL) {
-        Tcl_MutexUnlock(&listMutex);
-        Tcl_AppendResult(interp, "can not find threadpool \"", tpoolName,
-                         "\"", NULL);
+    if ((tpoolPtr = GetTpoolFromObj(interp, objv[1], 2)) == NULL) {
         return TCL_ERROR;
     }
 
+    Tcl_MutexLock(&listMutex);
     ret = TpoolRelease(tpoolPtr);
     Tcl_MutexUnlock(&listMutex);
+
+    /* wrap object to pure string object - indirect decrements a pool refCount and frees a pool if the last one */
+    Tcl_GetString(objv[1]);
+    TpoolObj_FreeInternalRep(objv[1]);
+
     Tcl_SetObjResult(interp, Tcl_NewIntObj(ret));
 
     return TCL_OK;
@@ -923,30 +1405,40 @@ TpoolSuspendObjCmd(dummy, interp, objc, objv)
     int         objc;           /* Number of arguments. */
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
-    char *tpoolName;
     ThreadPool *tpoolPtr;
+    int mode = TPOOL_SUSPEND_FULL;
 
     /*
-     * Syntax: tpool::suspend tpoolId
+     * Syntax: tpool::suspend ?-full|-jobs? tpoolId
      */
 
-    if (objc != 2) {
-        Tcl_WrongNumArgs(interp, 1, objv, "tpoolId");
+    if (objc < 2 || objc > 3) {
+        goto usage;
+    }
+
+    if (objc == 3) {
+        if (strcmp(Tcl_GetString(objv[1]), "-jobs") == 0) {
+            objv++; objc--;
+            mode = TPOOL_SUSPEND_JOBS;
+        } else if (strcmp(Tcl_GetString(objv[1]), "-full") == 0) {
+            objv++; objc--;
+            /* mode = TPOOL_SUSPEND_FULL; */
+        } else {
+            goto usage;
+        }
+    }
+
+    if ((tpoolPtr = GetTpoolFromObj(interp, objv[1], 1)) == NULL) {
         return TCL_ERROR;
     }
 
-    tpoolName = Tcl_GetString(objv[1]);
-    tpoolPtr  = GetTpool(tpoolName);
-
-    if (tpoolPtr == NULL) {
-        Tcl_AppendResult(interp, "can not find threadpool \"", tpoolName,
-                         "\"", NULL);
-        return TCL_ERROR;
-    }
-
-    TpoolSuspend(tpoolPtr);
+    TpoolSuspend(tpoolPtr, mode);
 
     return TCL_OK;
+
+usage:
+    Tcl_WrongNumArgs(interp, 1, objv, "?-full|-jobs? tpoolId");
+    return TCL_ERROR;
 }
 
 /*
@@ -973,7 +1465,6 @@ TpoolResumeObjCmd(dummy, interp, objc, objv)
     int         objc;           /* Number of arguments. */
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
-    char *tpoolName;
     ThreadPool *tpoolPtr;
 
     /*
@@ -985,16 +1476,11 @@ TpoolResumeObjCmd(dummy, interp, objc, objv)
         return TCL_ERROR;
     }
 
-    tpoolName = Tcl_GetString(objv[1]);
-    tpoolPtr  = GetTpool(tpoolName);
-
-    if (tpoolPtr == NULL) {
-        Tcl_AppendResult(interp, "can not find threadpool \"", tpoolName,
-                         "\"", NULL);
+    if ((tpoolPtr = GetTpoolFromObj(interp, objv[1], 1)) == NULL) {
         return TCL_ERROR;
     }
 
-    TpoolResume(tpoolPtr);
+    TpoolResume(interp, tpoolPtr);
 
     return TCL_OK;
 }
@@ -1024,18 +1510,61 @@ TpoolNamesObjCmd(dummy, interp, objc, objv)
     Tcl_Obj    *const objv[];   /* Argument objects. */
 {
     ThreadPool *tpoolPtr;
-    Tcl_Obj *listObj = Tcl_NewListObj(0, NULL);
+    Tcl_Obj    *listObj;
 
-    Tcl_MutexLock(&listMutex);
-    for (tpoolPtr = tpoolList; tpoolPtr; tpoolPtr = tpoolPtr->nextPtr) {
-        char buf[32];
-        sprintf(buf, "%s%p", TPOOL_HNDLPREFIX, tpoolPtr);
-        Tcl_ListObjAppendElement(interp, listObj, Tcl_NewStringObj(buf,-1));
+    if (objc == 1) {
+        listObj = Tcl_NewListObj(0, NULL);
+        Tcl_MutexLock(&listMutex);
+        for (tpoolPtr = tpoolList; tpoolPtr; tpoolPtr = tpoolPtr->nextPtr) {
+            Tcl_Obj *objPtr = Tcl_NewObj();
+            objPtr->bytes = NULL;
+            tpoolPtr->objRefCount++;
+            TpoolObj_SetObjIntRep(objPtr, tpoolPtr);
+            Tcl_ListObjAppendElement(interp, listObj, objPtr);
+        }
+        Tcl_MutexUnlock(&listMutex);
+        Tcl_SetObjResult(interp, listObj);
+
+        return TCL_OK;
     }
-    Tcl_MutexUnlock(&listMutex);
-    Tcl_SetObjResult(interp, listObj);
 
-    return TCL_OK;
+    if (objc == 2) {
+        TpoolWorker *poolWrk, *lastHead;
+
+        if ((tpoolPtr = GetTpoolFromObj(interp, objv[1], 1)) == NULL) {
+            return TCL_ERROR;
+        }
+
+        listObj = Tcl_NewListObj(0, NULL);
+
+        /* go over ring of workers */
+        Tcl_MutexLock(&tpoolPtr->mutex);
+        poolWrk = lastHead = tpoolPtr->workerRing;
+        while (poolWrk) {
+
+            Tcl_Obj *objPtr = ThreadNewThreadObj(poolWrk->threadId);
+
+            if (Tcl_ListObjAppendElement(interp, listObj, objPtr) != TCL_OK) {
+                Tcl_MutexUnlock(&tpoolPtr->mutex);
+                Tcl_DecrRefCount(listObj);
+                return TCL_ERROR;
+            }
+
+            poolWrk = poolWrk->nextWrk;
+            if (poolWrk == lastHead)
+                break;
+        }
+        Tcl_MutexUnlock(&tpoolPtr->mutex);
+
+        Tcl_SetObjResult(interp, listObj);
+        return TCL_OK;
+    }
+
+ usage:
+    Tcl_WrongNumArgs(interp, 1, objv,
+        "?tpoolId?"
+    );
+    return TCL_ERROR;
 }
 
 /*
@@ -1044,7 +1573,7 @@ TpoolNamesObjCmd(dummy, interp, objc, objv)
  * CreateWorker --
  *
  *  Creates new worker thread for the given pool. Assumes the caller
- *  holds the pool mutex.
+ *  holds the pool mutex, and if no "lock" holds the pool start mutex also.
  *
  * Results:
  *  None.
@@ -1055,12 +1584,21 @@ TpoolNamesObjCmd(dummy, interp, objc, objv)
  *----------------------------------------------------------------------
  */
 static int
-CreateWorker(interp, tpoolPtr)
+CreateWorker(interp, tpoolPtr, lock)
     Tcl_Interp *interp;
     ThreadPool *tpoolPtr;
+    int lock;
 {
     Tcl_ThreadId id;
     TpoolResult result;
+
+    if (tpoolPtr->tearDown || tpoolPtr->refCount <= 0) {
+        if (interp) {
+            Tcl_AppendResult(interp, "threadpool is shut down", NULL);
+            Tcl_SetErrorCode(interp, "TCL", "ESHUTDOWN", NULL);
+        }
+        return TCL_ERROR;
+    }
 
     /*
      * Initialize the result structure to be
@@ -1069,44 +1607,746 @@ CreateWorker(interp, tpoolPtr)
      */
 
     memset(&result, 0, sizeof(TpoolResult));
-    result.retcode  = -1;
     result.tpoolPtr = tpoolPtr;
+    result.threadId = Tcl_GetCurrentThread();
 
     /*
      * Create new worker thread here. Wait for the thread to start
      * because it's using the ThreadResult arg which is on our stack.
      */
 
-    Tcl_MutexLock(&startMutex);
-    if (Tcl_CreateThread(&id, TpoolWorker, (ClientData)&result,
+    if (lock) {
+        Tcl_MutexLock(&tpoolPtr->startMutex);
+    }
+    if (Tcl_CreateThread(&id, TpoolWorkerProc, (ClientData)&result,
                          TCL_THREAD_STACK_DEFAULT, 0) != TCL_OK) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("can't create a new thread", -1));
-        Tcl_MutexUnlock(&startMutex);
+        Tcl_MutexUnlock(&tpoolPtr->startMutex);
         return TCL_ERROR;
     }
-    while(result.retcode == -1) {
-        Tcl_ConditionWait(&tpoolPtr->cond, &startMutex, NULL);
+    while ( result.resultObj == NULL ) {
+        Tcl_ConditionWait(&tpoolPtr->cond, &tpoolPtr->startMutex, NULL);
     }
-    Tcl_MutexUnlock(&startMutex);
+    if (lock) {
+        Tcl_MutexUnlock(&tpoolPtr->startMutex);
+    }
 
     /*
      * Set error-related information if the thread
      * failed to initialize correctly.
      */
 
-    if (result.retcode == 1) {
-        result.retcode = TCL_ERROR;
-        SetResult(interp, &result);
-        return TCL_ERROR;
-    }
-
-    return TCL_OK;
+    return SetResult(interp, &result);
 }
 
 /*
  *----------------------------------------------------------------------
  *
- * TpoolWorker --
+ * RingAttachWorker --, RingDetachWorker ---
+ *
+ *  Add or remove worker to/from worker ring. Assumes the caller
+ *  holds the pool mutex (or possible the pool master holds the 
+ *  pool mutex and start mutex - only one started per pool).
+ *
+ * Results:
+ *  None.
+ *
+ * Side effects:
+ *  Informs waiter thread (if any) about the new worker thread.
+ *
+ *----------------------------------------------------------------------
+ */
+static void
+RingAttachWorker(poolWrk)
+    TpoolWorker *poolWrk;
+{
+    ThreadPool *tpoolPtr = poolWrk->tpoolPtr;
+
+    tpoolPtr->numWorkers++;
+    if (tpoolPtr->workerRing) {
+        /* add to tail (end of ring), ring points to first in buffer */
+        TpoolWorker * tailPtr;
+        poolWrk->prevWrk = tailPtr = tpoolPtr->workerRing->prevWrk;
+        poolWrk->nextWrk = tpoolPtr->workerRing;
+        tailPtr->nextWrk = tpoolPtr->workerRing->prevWrk = poolWrk;
+
+    } else {
+        /*  first one - is a self-contained ring */
+        tpoolPtr->workerRing = poolWrk->prevWrk = poolWrk->nextWrk = poolWrk;
+    }
+    _log_debug(" !!! ++ worker = %d/%d/%d, [%04X]/[%04X] ", 
+        tpoolPtr->idleWorkers, tpoolPtr->numWorkers, tpoolPtr->stopWorkers,
+        tpoolPtr->idleRing?tpoolPtr->idleRing->threadId:0,
+        tpoolPtr->workerRing?tpoolPtr->workerRing->threadId:0);
+}
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+RingDetachWorker(poolWrk)
+    TpoolWorker *poolWrk;
+{
+    ThreadPool *tpoolPtr = poolWrk->tpoolPtr;
+
+    /* if head - move ring to the next */
+    if (tpoolPtr->workerRing == poolWrk) {
+        tpoolPtr->workerRing = poolWrk->nextWrk;
+    }
+    /* if ring contains other elements then detach, otherwise make ring empty */
+    if (poolWrk != tpoolPtr->workerRing) {
+        poolWrk->prevWrk->nextWrk = poolWrk->nextWrk;
+        poolWrk->nextWrk->prevWrk = poolWrk->prevWrk;
+    } else {
+        tpoolPtr->workerRing = NULL;
+    }
+    poolWrk->nextWrk = poolWrk->prevWrk = NULL;
+    tpoolPtr->numWorkers--;
+    _log_debug(" !!! -- worker = %d/%d/%d, [%04X]/[%04X] ", 
+        tpoolPtr->idleWorkers, tpoolPtr->numWorkers, tpoolPtr->stopWorkers,
+        tpoolPtr->idleRing?tpoolPtr->idleRing->threadId:0,
+        tpoolPtr->workerRing?tpoolPtr->workerRing->threadId:0);
+}
+
+
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+RingAttachIdle(poolWrk)
+    TpoolWorker *poolWrk;
+{
+    ThreadPool *tpoolPtr = poolWrk->tpoolPtr;
+
+    /* add to tail of idle workers ring */
+    tpoolPtr->idleWorkers++;
+    if (tpoolPtr->idleRing) {
+        /* different head and tail inserts, corresponding shift-idle-ring mode, 
+         * so always prefer last worker if not "shift" */
+        if (!(tpoolPtr->flags & TPOOL_FLAG_SHIFT_IDLERING)) {
+            /* add to head (begin of ring), to be the turn again, so possible
+             * few context switches resp. cpu cache washout's - prevents L1-2 cache misses */
+            TpoolWorker * headPtr;
+            poolWrk->nextIdl = headPtr = tpoolPtr->idleRing;
+            poolWrk->prevIdl = headPtr->prevIdl;
+            tpoolPtr->idleRing = headPtr->prevIdl = headPtr->prevIdl->nextIdl = poolWrk;
+        } else {
+            /* add to tail (end of ring), ring points to first in buffer */
+            TpoolWorker * tailPtr;
+            poolWrk->prevIdl = tailPtr = tpoolPtr->idleRing->prevIdl;
+            poolWrk->nextIdl = tpoolPtr->idleRing;
+            tailPtr->nextIdl = tpoolPtr->idleRing->prevIdl = poolWrk;
+        }
+    } else {
+        /*  first one - is a self-contained ring */
+        tpoolPtr->idleRing = poolWrk->prevIdl = poolWrk->nextIdl = poolWrk;
+        /* always move worker ring head to the first idle */
+        tpoolPtr->workerRing = poolWrk;
+    }
+    _log_debug(" !!! ++ idle = %d/%d/%d, [%04X]/[%04X] ", 
+        tpoolPtr->idleWorkers, tpoolPtr->numWorkers, tpoolPtr->stopWorkers,
+        tpoolPtr->idleRing?tpoolPtr->idleRing->threadId:0,
+        tpoolPtr->workerRing?tpoolPtr->workerRing->threadId:0);
+}
+
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+RingDetachIdle(poolWrk)
+    TpoolWorker *poolWrk;
+{
+    ThreadPool *tpoolPtr = poolWrk->tpoolPtr;
+
+    /* if head - move ring to the next */
+    if (tpoolPtr->idleRing == poolWrk) {
+        tpoolPtr->idleRing = poolWrk->nextIdl;
+    }
+    /* if ring contains other elements then detach, otherwise make ring empty */
+    if (poolWrk != tpoolPtr->idleRing) {
+        /* ring contains other elements then detach */
+        poolWrk->prevIdl->nextIdl = poolWrk->nextIdl;
+        poolWrk->nextIdl->prevIdl = poolWrk->prevIdl;
+    } else {
+        /* no more elements - make ring empty */
+        tpoolPtr->idleRing = NULL;
+    }
+    poolWrk->nextIdl = poolWrk->prevIdl = NULL;
+    tpoolPtr->idleWorkers--;
+    _log_debug(" !!! -- idle = %d/%d/%d, [%04X]/[%04X] ", 
+        tpoolPtr->idleWorkers, tpoolPtr->numWorkers, tpoolPtr->stopWorkers,
+        tpoolPtr->idleRing?tpoolPtr->idleRing->threadId:0,
+        tpoolPtr->workerRing?tpoolPtr->workerRing->threadId:0);
+}
+
+/*
+ *----------------------------------------------------------------------
+ *
+ * TpoolDeleteEvent --
+ *
+ *  This will be called by exit of worker to delete pool tasks related
+ *  to events that we put on the queue.
+ *
+ * Results:
+ *  1 it was our event and we want it removed, 0 otherwise.
+ *
+ * Side effects:
+ *  It cleans up our events in the event queue for this thread.
+ *
+ *----------------------------------------------------------------------
+ */
+static int
+TpoolDeleteEvent(eventPtr, clientData)
+    Tcl_Event *eventPtr;        /* Really ThreadEvent */
+    ClientData clientData;      /* dummy */
+{
+    if (eventPtr->proc == WorkEvent) {
+
+        TpoolEvent  *poolEvent = (TpoolEvent*)(eventPtr+1);
+        TpoolResult *rPtr     = poolEvent->rPtr;
+        
+        if (rPtr != NULL) {
+
+            TpoolWorker *poolWrk  = poolEvent->poolWrk;
+            ThreadPool  *tpoolPtr = poolWrk->tpoolPtr;
+            /* if pool still alive */
+            if (!tpoolPtr->tearDown) {
+                /* we can't process work - add it to the queue */
+                Tcl_MutexLock(&tpoolPtr->mutex);
+
+                /* pool still alive in lock */
+                if (!tpoolPtr->tearDown) {
+                    PushWork(rPtr, tpoolPtr);
+                    rPtr = NULL;
+                    /* wake resp. notify idle worker (because not idle will wake itself later if jobs available) */
+                    if (!tpoolPtr->suspend && tpoolPtr->idleWorkers) {
+                        SignalWorker(tpoolPtr, -1, NULL, TCL_QUEUE_TAIL);
+                    }
+                }
+
+                Tcl_MutexUnlock(&tpoolPtr->mutex);
+            } 
+            if (rPtr != NULL) {
+                /* just free not processed jobs */
+                Tcl_DecrRefCount(rPtr->script);
+                ckfree((char*)rPtr);
+            }
+        }
+        return 1;
+    } 
+    else 
+    if (eventPtr->proc == TpoolReloadEvent) {
+        TpoolEvent  *poolEvent = (TpoolEvent*)(eventPtr+1);
+        Tcl_Obj  *reloadScript = (Tcl_Obj*)poolEvent->rPtr;
+        if (reloadScript != NULL) {
+            Tcl_DecrRefCount(reloadScript);
+        }
+        return 1;
+    }
+    /* remain foreign events in the queue ... */
+    return (eventPtr->proc == NULL || eventPtr->proc == ServiceEvent);
+}
+
+/*
+ *----------------------------------------------------------------------
+ */
+static int
+TpoolWorkerServiceCmd(
+    ClientData  clientData,     /* Pool worker handle */
+    Tcl_Interp *interp,         /* Current interpreter. */
+    int         objc,           /* Number of arguments. */
+    Tcl_Obj    *const objv[]    /* Argument objects. */
+) 
+{
+    TpoolWorker  *poolWrk = (TpoolWorker*)clientData;
+    int inflag;
+    if (objc <= 1) {
+        goto usage;
+    }
+    /* svc command (get/set servicing flag, to provide an opportunity to remain the worker in idle state) */
+    /* inwork command (get/set in work flag) - provide an opportunity to process other pool works (disable discrete mode once) */
+    if (strcmp(Tcl_GetString(objv[1]), "-svc") == 0) {
+        inflag = TPWRK_FLAG_SVC;
+    } else if (strcmp(Tcl_GetString(objv[1]), "-inwork") == 0) {
+        inflag = TPWRK_FLAG_INWORK;
+    } else {
+        goto usage;
+    }
+    if (objc == 2) {
+        Tcl_SetObjResult(interp, Tcl_NewIntObj(poolWrk && poolWrk->flags & inflag ? 1 : 0));
+        return TCL_OK;
+    }
+    if (objc == 3) {
+        int flag;
+        if (Tcl_GetBooleanFromObj(interp, objv[2], &flag) != TCL_OK) {
+            return TCL_ERROR;
+        }
+        if (poolWrk) {
+            if (flag)
+                poolWrk->flags |= inflag;
+            else
+                poolWrk->flags &= ~inflag;
+        } else {
+            flag = 0;
+        }
+        Tcl_SetObjResult(interp, Tcl_NewIntObj(flag));
+        return TCL_OK;
+    }
+
+ usage:
+    Tcl_WrongNumArgs(interp, 1, objv,
+        "-svc ?boolean?|-inwork ?boolean?"
+    );
+    return TCL_ERROR;
+}
+
+/*
+ *----------------------------------------------------------------------
+ */
+static int
+ServiceEvent(Tcl_Event *eventPtr, int mask)
+{
+    TpoolEvent  *poolEvent = (TpoolEvent*)(eventPtr+1);
+    TpoolWorker *poolWrk  = poolEvent->poolWrk;
+    ThreadPool  *tpoolPtr = poolWrk->tpoolPtr;
+
+    _log_debug("  !!! service event ... %d", HasWork(tpoolPtr));
+   
+    /* simple service event (wakeup) - set service flag,
+     * make possible to leave thread in idle state if no work in queue ... */
+    if (!HasWork(tpoolPtr)) {
+        poolWrk->flags |= TPWRK_FLAG_SVC;
+    }
+    return 1;
+}
+
+/*
+ *----------------------------------------------------------------------
+ */
+static int
+WorkEvent(Tcl_Event *eventPtr, int mask)
+{
+    TpoolEvent  *poolEvent = (TpoolEvent*)(eventPtr+1);
+    TpoolWorker *poolWrk  = poolEvent->poolWrk;
+    TpoolResult *rPtr     = poolEvent->rPtr;
+    ThreadPool  *tpoolPtr = poolWrk->tpoolPtr;
+    int          lock = 0;
+    int          processed = 1;
+
+    _log_debug("  !!! work event ... %p / %d", rPtr, HasWork(tpoolPtr))
+
+again:
+
+    if (tpoolPtr->tearDown) {
+
+        if (!lock) {lock=1; Tcl_MutexLock(&tpoolPtr->mutex);}
+
+        if (tpoolPtr->tearDown) {
+            /* distributed work */
+            if (rPtr != NULL) {
+                if (tpoolPtr->tearDown <= 1) {
+                    /* we can't process work - add it to the queue */
+                    PushWork(rPtr, tpoolPtr);
+                    /* don't signal worker - pool suspended or shutdown */
+                } else {
+                    Tcl_DecrRefCount(rPtr->script);
+                    ckfree((char*)rPtr);
+                }
+            }
+            goto done;
+        }
+
+    }
+
+    if (tpoolPtr->suspend) {
+
+        if (lock) {lock=0; Tcl_MutexUnlock(&tpoolPtr->mutex);}
+        /* active or passive wait in suspend ? */
+        Tcl_MutexLock(&tpoolPtr->startMutex);
+        while (tpoolPtr->suspend && tpoolPtr->suspend != TPOOL_SUSPEND_JOBS) {
+            _log_debug("  !!! suspended all: cond wait ...")
+            Tcl_ConditionWait(&tpoolPtr->cond, &tpoolPtr->startMutex, NULL);
+        }
+        if (tpoolPtr->suspend == TPOOL_SUSPEND_JOBS) {
+            Tcl_MutexUnlock(&tpoolPtr->startMutex);
+            if (rPtr != NULL) {
+                /* refuse event - process it later */
+                _log_debug("  !!! suspended: refuse event, do work later")
+                processed = 0;
+            } else {
+                /* go to suspend state in worker proc */
+                _log_debug("  !!! suspended: service event ...")
+                poolWrk->flags |= TPWRK_FLAG_SVC;
+            }
+            goto done;
+        }
+        Tcl_MutexUnlock(&tpoolPtr->startMutex);
+        
+    }
+
+    /* 
+     * in discrete mode, prevent execute another work if still in work, so check already in work,
+     * can occur when update/vwait/etc was called during the work
+     */
+    if ( (tpoolPtr->flags & TPOOL_FLAG_DISCRETE) && (poolWrk->flags & TPWRK_FLAG_INWORK) ) {
+        /* if distributed, refuse this event - process it later; 
+           otherwise - simply ignore this event (PopWork/wake-empty) */
+        if (rPtr != NULL) {
+            _log_debug("  !!! still in work: refuse event, do this work later")
+            processed = 0;
+        } else {
+            _log_debug("  !!! still in work: ignore event")
+        }
+        goto done;
+    }
+    /* idle, can process work */
+
+    /* if not distributed - get job from pool queue */
+    if (rPtr == NULL) {
+        if (!lock) {lock=1; Tcl_MutexLock(&tpoolPtr->mutex);}
+        /* we locked the mutex, check again */
+        if (tpoolPtr->suspend || tpoolPtr->tearDown)
+            goto again;
+
+        rPtr = PopWork(tpoolPtr);
+    }
+
+    if (rPtr != NULL) {
+        /* work, reset idle - signal busy */
+        poolWrk->flags = (poolWrk->flags & ~TPWRK_FLAG_IDLE) | TPWRK_FLAG_INWORK;
+        /* busy - if not yet already */
+        if (poolWrk->nextIdl) {
+            if (!lock) {lock=1; Tcl_MutexLock(&tpoolPtr->mutex);}
+            if (poolWrk->nextIdl) {
+                RingDetachIdle(poolWrk);
+            }
+        }
+
+        if (lock) {lock=0; Tcl_MutexUnlock(&tpoolPtr->mutex);}
+
+        /* execute an job */
+        _log_debug(" !!! exec job ... %p ", rPtr);
+        TpoolEval(poolWrk->interp, rPtr->script, rPtr);
+        
+        Tcl_DecrRefCount(rPtr->script);
+
+        /* reset in work flag, don't set idle flag - will be set later in the main cycle */
+        poolWrk->flags &= ~TPWRK_FLAG_INWORK;
+
+        /* if result should be delivered to the pool - add the result to jobs done */
+        if (!rPtr->detached) {
+            int new;
+            if (!lock) {lock=1; Tcl_MutexLock(&tpoolPtr->mutex);}
+            if (tpoolPtr->tearDown <= 1) {
+                Tcl_SetHashValue(
+                    Tcl_CreateHashEntry(
+                        &tpoolPtr->jobsDone, (void *)(size_t)rPtr->jobId, &new),
+                    (ClientData)rPtr
+                );
+                SignalWaiter(tpoolPtr, rPtr->threadId);
+            } else {
+                SetResult(NULL, rPtr);
+                ckfree((char*)rPtr);
+            }
+        } else {
+            ckfree((char*)rPtr);
+        }
+        rPtr = NULL;
+    } else {
+        // no work, if idle - signal it was a service event, idle will be continued:
+        if (poolWrk->flags & TPWRK_FLAG_IDLE)
+            poolWrk->flags |= TPWRK_FLAG_SVC;
+    }
+
+done:
+
+    if (lock) {lock=0; Tcl_MutexUnlock(&tpoolPtr->mutex);}
+    return processed;
+}
+
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+WorkerIdleTOut(ClientData clientData)
+{
+    TpoolWorker  *poolWrk = (TpoolWorker*)clientData;
+    _log_debug(" !!! idle timeout timer ... ");
+    /* if still idle - signal timeout occurred: */
+    poolWrk->flags = (poolWrk->flags & ~TPWRK_FLAG_IDLTMR) | TPWRK_FLAG_SVC;
+    if (poolWrk->flags & TPWRK_FLAG_IDLE) {
+        poolWrk->flags |= TPWRK_FLAG_IDLTOUT;
+    }
+    /* we should repeat an idle interval/time events */
+    Tcl_GetTime(&poolWrk->idleStartTm);
+}
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+WorkerIdle(ClientData clientData) 
+{
+    TpoolWorker  *poolWrk = (TpoolWorker*)clientData;
+    ThreadPool   *tpoolPtr = poolWrk->tpoolPtr;
+
+    _log_debug(" !!! idle event (latency) ... ");
+    if (poolWrk->idleScript != NULL && (poolWrk->flags & TPWRK_FLAG_IDLE)) {
+        int oldMode = Tcl_SetServiceMode(TCL_SERVICE_NONE);
+        _log_debug(" !!! exec idle command ... ");
+        if (Tcl_EvalObjEx(poolWrk->interp, poolWrk->idleScript, TCL_EVAL_GLOBAL) != TCL_OK) {
+            ThreadErrorProc(poolWrk->interp);
+        }
+        (void) Tcl_SetServiceMode(oldMode);
+    }
+
+    /* idle latency elapsed (don't reset/repeat until idle) + service flag */
+    poolWrk->flags |= TPWRK_FLAG_SVC;
+}
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+WorkerIdleInt(ClientData clientData) 
+{
+    TpoolWorker  *poolWrk = (TpoolWorker*)clientData;
+    ThreadPool   *tpoolPtr = poolWrk->tpoolPtr;
+
+    _log_debug(" !!! idle interval event ... ");
+    if (poolWrk->idleIntScript != NULL && (poolWrk->flags & TPWRK_FLAG_IDLE)) {
+        int oldMode = Tcl_SetServiceMode(TCL_SERVICE_NONE);
+        _log_debug(" !!! exec idle int command ... ");
+        if (Tcl_EvalObjEx(poolWrk->interp, poolWrk->idleIntScript, TCL_EVAL_GLOBAL) != TCL_OK) {
+            ThreadErrorProc(poolWrk->interp);
+        }
+        (void) Tcl_SetServiceMode(oldMode);
+    }
+
+    /* repeateable interval, signal the idle was executed */
+    poolWrk->flags = (poolWrk->flags & ~TPWRK_FLAG_IDLINT) | TPWRK_FLAG_SVC;
+    /* we should repeat an idle interval */
+    Tcl_GetTime(&poolWrk->idleIntTm);
+}
+
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+WorkerSetMaxBlockTime(Tcl_Time *nowTime, Tcl_Time *startTime, Tcl_Time *offs)
+{
+    Tcl_Time blockTime;
+    blockTime.sec = startTime->sec + offs->sec - nowTime->sec;
+    blockTime.usec = startTime->usec + offs->usec - nowTime->usec;
+    while (blockTime.usec < 0) {
+        blockTime.sec--;
+        blockTime.usec += 1000000;
+    }
+    while (blockTime.usec >= 1000000) {
+        blockTime.sec++;
+        blockTime.usec -= 1000000;
+    }
+    if (blockTime.sec < 0 || (blockTime.sec == 0 && blockTime.usec < 0)) {
+        blockTime.sec = 0;
+        blockTime.usec = 0;
+    }
+    _log_debug(" !!! block time ... %d.%d", blockTime.sec, blockTime.usec);
+    Tcl_SetMaxBlockTime(&blockTime);
+}
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+WorkerEventSetupProc(TpoolWorker *poolWrk, int flags)
+{
+    ThreadPool *tpoolPtr;
+    Tcl_Time    nowTime;
+    int         nf = 0;
+
+    /* if don't wait or not exec idle events or not idle worker */
+    if (
+        (flags & TCL_DONT_WAIT) != 0 || (flags & TCL_IDLE_EVENTS) == 0
+     || (poolWrk->flags & TPWRK_FLAG_IDLE) == 0
+    ) {
+        return;
+    }
+
+    /* setup or prolong idle "timers" - latency, interval, timeout */
+    tpoolPtr = poolWrk->tpoolPtr;
+    if ( 
+      (poolWrk->flags & TPWRK_FLAG_IDLLAT) == 0
+    ) {
+        if (!nf) {nf = 1; Tcl_GetTime(&nowTime);}
+        WorkerSetMaxBlockTime(&nowTime, &poolWrk->idleStartTm, &tpoolPtr->idleLatency);
+    }
+    else
+    if (
+      poolWrk->idleIntScript != NULL && (poolWrk->flags & TPWRK_FLAG_IDLINT) == 0
+    ) {
+        if (!nf) {nf = 1; Tcl_GetTime(&nowTime);}
+        WorkerSetMaxBlockTime(&nowTime, &poolWrk->idleIntTm, &tpoolPtr->idleIntTime);
+    }
+
+    if (
+        (poolWrk->flags & TPWRK_FLAG_IDLTMR) == 0 &&
+        TimeIsNonZero(tpoolPtr->idleTime)
+    ) {
+        if (!nf) {nf = 1; Tcl_GetTime(&nowTime);}
+        WorkerSetMaxBlockTime(&nowTime, &poolWrk->idleStartTm, &tpoolPtr->idleTime);
+    }
+}
+
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+WorkerEventCheckProc(TpoolWorker *poolWrk, int flags)
+{
+    ThreadPool *tpoolPtr;
+    Tcl_Time    nowTime, endOfWait; 
+    int         nf = 0;
+
+    if ( 
+        (flags & TCL_DONT_WAIT) != 0 || (flags & TCL_IDLE_EVENTS) == 0
+     || (poolWrk->flags & TPWRK_FLAG_IDLE) == 0 
+    ) {
+        return;
+    }
+
+    /* create idle events if configured time (since idle start) reached */
+    tpoolPtr = poolWrk->tpoolPtr;
+    if ( (poolWrk->flags & TPWRK_FLAG_IDLLAT) == 0 ) {
+        endOfWait = poolWrk->idleStartTm;
+        TimeAddTime(endOfWait, tpoolPtr->idleLatency);
+        if (!nf) {nf = 1; Tcl_GetTime(&nowTime);}
+        if ( TimeGreaterOrEqual(nowTime, endOfWait) ) {
+            if (poolWrk->idleScript != NULL) {
+              Tcl_DoWhenIdle(WorkerIdle, (ClientData)poolWrk);
+            }
+            /* idle latency elapsed */
+            poolWrk->flags |= TPWRK_FLAG_IDLLAT;
+            /* we should repeat an idle interval */
+            Tcl_GetTime(&poolWrk->idleIntTm);
+
+        }
+    }
+    else
+    if ( 
+        poolWrk->idleIntScript != NULL &&
+        (poolWrk->flags & TPWRK_FLAG_IDLINT) == 0
+    ) {
+        endOfWait = poolWrk->idleIntTm;
+        TimeAddTime(endOfWait, tpoolPtr->idleIntTime);
+        if (!nf) {nf = 1; Tcl_GetTime(&nowTime);}
+        if ( TimeGreaterOrEqual(nowTime, endOfWait) ) {
+            Tcl_DoWhenIdle(WorkerIdleInt, (ClientData)poolWrk);
+            poolWrk->flags |= TPWRK_FLAG_IDLINT;
+        }
+    }
+
+    if (
+        (poolWrk->flags & TPWRK_FLAG_IDLTMR) == 0 &&
+        TimeIsNonZero(tpoolPtr->idleTime) 
+    ) {
+        endOfWait = poolWrk->idleStartTm;
+        TimeAddTime(endOfWait, tpoolPtr->idleTime);
+        if (!nf) {nf = 1; Tcl_GetTime(&nowTime);}
+        if ( TimeGreaterOrEqual(nowTime, endOfWait) ) {
+            Tcl_DoWhenIdle(WorkerIdleTOut, (ClientData)poolWrk);
+            poolWrk->flags |= TPWRK_FLAG_IDLTMR;
+        }
+    }
+}
+
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+WorkerExitHandler(ClientData clientData)
+{
+    TpoolWorker  *poolWrk = (TpoolWorker*)clientData;
+    ThreadPool   *tpoolPtr;
+
+    _log_debug(" !!! worker exit handler ...");
+    
+    if (poolWrk == NULL) {
+        return;
+    }
+
+    /* cleanup worker of pool */
+    tpoolPtr = poolWrk->tpoolPtr;
+
+    if (tpoolPtr != NULL) {
+
+        _log_debug(" !!! worker delete events ... ");
+
+        /* move distributed jobs to pool (if not tear down), release other event data */
+        Tcl_DeleteEvents((Tcl_EventDeleteProc*)TpoolDeleteEvent, NULL);
+
+        _log_debug(" !!! worker stop ... ");
+
+        Tcl_MutexLock(&tpoolPtr->mutex);
+
+        /* worker goes down - create replacement for this if expected (pool still alive) */
+        if (
+            poolWrk->interp && !(poolWrk->flags & TPWRK_FLAG_ERROR) &&
+            !tpoolPtr->suspend && !tpoolPtr->tearDown 
+          && (
+               tpoolPtr->numWorkers < tpoolPtr->minWorkers
+            || (HasWork(tpoolPtr) && tpoolPtr->numWorkers < tpoolPtr->maxWorkers)
+          )
+        ) {
+            if (CreateWorker(poolWrk->interp, tpoolPtr, 1) != TCL_OK) {
+                ThreadErrorProc(poolWrk->interp);
+                /* bgerror can be an idle event, so process it now */
+                while (Tcl_DoOneEvent(TCL_IDLE_EVENTS)) {};
+            }
+
+            /* signal idle (waiter) workers to be sure jobs will be acquired */
+            SignalWorker(tpoolPtr, -1, TPOOL_SVC_EVENT, TCL_QUEUE_TAIL);
+        }
+
+        _log_debug(" !!! worker stopped");
+
+        /* signal waiter if tear down */
+        tpoolPtr->stopWorkers--;
+        if (tpoolPtr->waiterId) {
+            SignalWaiter(tpoolPtr, tpoolPtr->waiterId);
+        }
+
+        poolWrk->tpoolPtr = NULL;
+
+        Tcl_MutexUnlock(&tpoolPtr->mutex);
+
+        if (poolWrk->idleScript != NULL) {
+            Tcl_DecrRefCount(poolWrk->idleScript);
+        }
+        if (poolWrk->idleIntScript != NULL) {
+            Tcl_DecrRefCount(poolWrk->idleIntScript);
+        }
+
+    }
+
+    if (poolWrk->interp) {
+        Tcl_Interp * interp = poolWrk->interp;
+        poolWrk->interp = NULL;
+
+        _log_debug(" !!! worker delete interp ... ");
+
+    #ifdef NS_AOLSERVER
+        Ns_TclMarkForDelete(interp);
+        Ns_TclDeAllocateInterp(interp);
+    #else
+        Tcl_DeleteInterp(interp);
+    #endif
+
+        Tcl_Release((ClientData)interp);
+    }
+
+    ckfree((char*)poolWrk);
+    _log_debug(" !!! worker exit handler - done.");
+}
+/*
+ *----------------------------------------------------------------------
+ *
+ * TpoolWorkerProc --
  *
  *  This is the main function of each of the threads in the pool.
  *
@@ -1120,158 +2360,337 @@ CreateWorker(interp, tpoolPtr)
  */
 
 static Tcl_ThreadCreateType
-TpoolWorker(clientData)
+TpoolWorkerProc(clientData)
     ClientData clientData;
 {
     TpoolResult          *rPtr = (TpoolResult*)clientData;
     ThreadPool       *tpoolPtr = rPtr->tpoolPtr;
+    Tcl_ThreadId startWaiterId;
+    struct ThreadSpecificData * threadTsdPtr = Thread_TSD_Init();
 
-    int tout = 0;
     Tcl_Interp *interp;
-    Tcl_Time waitTime, *idlePtr;
-    const char *errMsg;
+    TpoolWorker  *poolWrk = NULL;
+    int         ret, retcode = -1;
 
-    Tcl_MutexLock(&startMutex);
+    poolWrk = (TpoolWorker*)ckalloc(sizeof(TpoolWorker));
+    if (!poolWrk) {
+        retcode = TCL_ERROR;
+        goto end;
+    }
+    memset(poolWrk, 0, sizeof(*poolWrk));
+    poolWrk->tpoolPtr = tpoolPtr;
+    poolWrk->threadId = Tcl_GetCurrentThread();
+
+    /* create exit handler for cleanups */
+    Tcl_CreateThreadExitHandler(WorkerExitHandler, (ClientData)poolWrk);
+
+    _log_debug(" !!! worker start ... ");
+
+    Tcl_MutexLock(&tpoolPtr->startMutex);
 
     /*
      * Initialize the Tcl interpreter
      */
 
 #ifdef NS_AOLSERVER
-    interp = (Tcl_Interp*)Ns_TclAllocateInterp(NULL);
-    rPtr->retcode = 0;
+    poolWrk->interp = interp = (Tcl_Interp*)Ns_TclAllocateInterp(NULL);
+    if (!interp) {
+        retcode = TCL_ERROR;
+    }
 #else
-    interp = Tcl_CreateInterp();
-    if (Tcl_Init(interp) != TCL_OK) {
-        rPtr->retcode = 1;
-    } else if (Thread_Init(interp) != TCL_OK) {
-        rPtr->retcode = 1;
-    } else {
-        rPtr->retcode = 0;
+    poolWrk->interp = interp = Tcl_CreateInterp();
+    if (!interp) {
+        retcode = TCL_ERROR;
+    }
+
+    if (interp) {
+        Tcl_Preserve((ClientData)interp);
+
+        if (Tcl_Init(interp) != TCL_OK) {
+            retcode = TCL_ERROR;
+        } else if (Thread_Init(interp) != TCL_OK) {
+            retcode = TCL_ERROR;
+        } else {
+            /* (re)create svc command with poolWrk handle */
+            if (Tcl_CreateObjCommand(interp, THREAD_CMD_PREFIX"svc", 
+                TpoolWorkerServiceCmd, (ClientData)poolWrk, NULL) == NULL
+            ) {
+                retcode = TCL_ERROR;
+            }
+        }
     }
 #endif
 
-    if (rPtr->retcode == 1) {
-        errMsg = Tcl_GetString(Tcl_GetObjResult(interp));
-        rPtr->result = strcpy(ckalloc(strlen(errMsg)+1), errMsg);
-        Tcl_ConditionNotify(&tpoolPtr->cond);
-        Tcl_MutexUnlock(&startMutex);
-        goto out;
-    }
-
     /*
-     * Initialize the interpreter
+     * Initialize the worker (call init script)
      */
 
-    if (tpoolPtr->initScript) {
-        TpoolEval(interp, tpoolPtr->initScript, -1, rPtr);
-        if (rPtr->retcode != TCL_OK) {
-            rPtr->retcode = 1;
-            errMsg = Tcl_GetString(Tcl_GetObjResult(interp));
-            rPtr->result  = strcpy(ckalloc(strlen(errMsg)+1), errMsg);
-            Tcl_ConditionNotify(&tpoolPtr->cond);
-            Tcl_MutexUnlock(&startMutex);
-            goto out;
+    if (interp && tpoolPtr->initScript) {
+        Tcl_Obj *objPtr = Sv_DuplicateObj(tpoolPtr->initScript);
+        Tcl_IncrRefCount(objPtr);
+        retcode = TpoolEval(interp, objPtr, rPtr);
+        Tcl_DecrRefCount(objPtr);
+        if (retcode != TCL_OK) {
+            retcode = TCL_ERROR;
         }
     }
 
+    if (retcode == TCL_ERROR) {
+        /* prevent pool from releasing of tpoolPtr before worker exit */
+        tpoolPtr->stopWorkers++;
+        /* mark worker in error state */
+        poolWrk->flags |= TPWRK_FLAG_ERROR;
+        /* set error if not yet in result */
+        if (!rPtr->resultObj) {
+            if (interp) {
+                Tcl_InitObjRef(rPtr->resultObj, 
+                    ThreadGetReturnInterpStateObj(interp, retcode));
+            } else {
+                Tcl_InitObjRef(rPtr->resultObj,
+                    ThreadErrorInterpStateObj(TCL_ERROR, "init interp failed!", "TCL EFAULT"));
+            }
+        }
+        /* tell caller and done */
+        Tcl_ConditionNotify(&tpoolPtr->cond);
+        Tcl_MutexUnlock(&tpoolPtr->startMutex);
+        goto end;
+    }
+
+    RingAttachWorker(poolWrk);
+
     /*
-     * Setup idle timer
+     * Tell caller we've started successfull
      */
 
-    if (tpoolPtr->idleTime == 0) {
-        idlePtr = NULL;
-    } else {
-        waitTime.sec  = tpoolPtr->idleTime;
-        waitTime.usec = 0;
-        idlePtr = &waitTime;
+    retcode = TCL_OK;
+    startWaiterId = rPtr->threadId;
+    Tcl_SetObjRef(rPtr->resultObj, Tcl_NewObj());
+    Tcl_ConditionNotify(&tpoolPtr->cond);
+    Tcl_MutexUnlock(&tpoolPtr->startMutex);
+
+
+    poolWrk->idleScript = Sv_DupIncrObj(tpoolPtr->idleScript);
+    poolWrk->idleIntScript = Sv_DupIncrObj(tpoolPtr->idleIntScript);
+
+    _log_debug(" !!! worker started ... ");
+    Tcl_MutexLock(&tpoolPtr->mutex);
+
+    RingAttachIdle(poolWrk);
+
+    SignalWaiter(tpoolPtr, startWaiterId);
+
+    Tcl_MutexUnlock(&tpoolPtr->mutex);
+
+    if (
+         (tpoolPtr->idleScript != NULL)
+      || (tpoolPtr->idleIntScript != NULL)
+      || TimeIsNonZero(tpoolPtr->idleTime)
+    ) {
+        Tcl_CreateEventSource(WorkerEventSetupProc, WorkerEventCheckProc, poolWrk);
     }
 
     /*
-     * Tell caller we've started
+     * Wait for jobs to arrive, simultaneous process events of tcl-core.
      */
 
-    tpoolPtr->numWorkers++;
-    Tcl_ConditionNotify(&tpoolPtr->cond);
-    Tcl_MutexUnlock(&startMutex);
+    while ( !Thread_Stopped(threadTsdPtr) ) {
+        int val;
 
-    /*
-     * Wait for jobs to arrive. Note the handcrafted time test.
-     * Tcl API misses the return value of the Tcl_ConditionWait().
-     * Hence, we do not know why the call returned. Was it someone
-     * signalled the variable or has the idle timer expired?
-     */
+        if (tpoolPtr->tearDown) {
+            Tcl_MutexLock(&tpoolPtr->mutex);
+            val = tpoolPtr->tearDown;
+            Tcl_MutexUnlock(&tpoolPtr->mutex);
+            if (val) {
+                /* shutdown */
+                break;
+            }
+        }
+
+        if (tpoolPtr->suspend) {
+            /* active or passive wait in suspend ? */
+            if (tpoolPtr->suspend != TPOOL_SUSPEND_JOBS) {
+                Tcl_MutexLock(&tpoolPtr->startMutex);
+                while (tpoolPtr->suspend && tpoolPtr->suspend != TPOOL_SUSPEND_JOBS) {
+                    _log_debug("  !!! suspend all: cond wait ...")
+                    Tcl_ConditionWait(&tpoolPtr->cond, &tpoolPtr->startMutex, NULL);
+                }
+                Tcl_MutexUnlock(&tpoolPtr->startMutex);
+            }
+            if (tpoolPtr->suspend == TPOOL_SUSPEND_JOBS) {
+                _log_debug("  !!! suspend work: wait within event ...")
+            }
+        }
+
+        _log_debug(" !!! wait-cycle .  %s, flags: %02X ", "*", poolWrk->flags);
+        poolWrk->flags &= ~TPWRK_FLAG_SVC;
+        /* process events of tcl-core without wait (check idle) */
+        ret = Tcl_DoOneEvent((TCL_ALL_EVENTS & ~TCL_IDLE_EVENTS) | TCL_DONT_WAIT);
+        _log_debug(" !!! ev w/o wait = %d, flags: %02X ", ret, poolWrk->flags);
+
+        /* no more events */
+        if (!ret) {
+            int lock = 0;
+            
+            /* if worker goes idle */
+            if ( !(poolWrk->flags & TPWRK_FLAG_IDLE) && !tpoolPtr->suspend ) {
+
+                /* 
+                 * no events processed but pool has jobs, be sure all jobs will be processed:
+                 * possible some worker missed a signal (or no signal because no idle workers), 
+                 * or just resumed after suspend
+                 */
+                if (HasWork(tpoolPtr)) {
+                    TpoolResult *rPtr;
+                    if (!lock) {lock=1; Tcl_MutexLock(&tpoolPtr->mutex);};
+                    if (!tpoolPtr->suspend && !tpoolPtr->tearDown && (rPtr = PopWork(tpoolPtr))) {
+                        /* send work to itself (via event) */
+                        SignalWorkerInner(poolWrk, WorkEvent, rPtr, TCL_QUEUE_TAIL);
+                        lock = 0; Tcl_MutexUnlock(&tpoolPtr->mutex);
+                        /* don't wait - has job now - repeat process event right now */
+                        continue;
+                    }
+                }
+
+                poolWrk->flags |= TPWRK_FLAG_IDLE;
+                Tcl_GetTime(&poolWrk->idleStartTm);
+                poolWrk->idleIntTm = poolWrk->idleStartTm;
+
+                /* attach worker to idle ring, if it not yet belong */
+                if (!poolWrk->nextIdl) {
+                    if (!lock) {lock=1; Tcl_MutexLock(&tpoolPtr->mutex);}
+                    if (!poolWrk->nextIdl) {
+                        RingAttachIdle(poolWrk);
+                    }
+                }
+                /* pool still has job, check in lock again (if worker goes idle) */
+                if (lock && !tpoolPtr->suspend && HasWork(tpoolPtr)) {
+                    SignalWorkerInner(poolWrk, WorkEvent, NULL, TCL_QUEUE_TAIL);
+                }
+
+                if (lock) {lock=0; Tcl_MutexUnlock(&tpoolPtr->mutex);}
+            }
+
+            /* wait for job, simultaneous process events of tcl-core */
+            _log_debug(" !!! wait 4 event  %s, flags: %02X ", "*", poolWrk->flags);
+            poolWrk->flags &= ~TPWRK_FLAG_SVC;
+            ret = Tcl_DoOneEvent(TCL_ALL_EVENTS);
+            _log_debug(" !!! end of wait = %d, flags: %02X ", ret, poolWrk->flags);
+        }
+        /* service event - no work, still idle */
+        if ((poolWrk->flags & TPWRK_FLAG_SVC)) {
+            poolWrk->flags &= ~TPWRK_FLAG_SVC;
+            ret = 0;
+        }
+        /* mark as busy if event was not a idle/service event */
+        if (ret) {
+            poolWrk->flags &= ~(TPWRK_FLAG_IDLE|TPWRK_FLAG_IDLTOUT);
+        }
+
+        /* if worker no more idle - reset timer/event if was set */
+        if ( !(poolWrk->flags & TPWRK_FLAG_IDLE) ) {
+            /* cancel events, reset signals to setup "timers" again */
+            if (poolWrk->flags & TPWRK_FLAG_IDLLAT) {
+                Tcl_CancelIdleCall(WorkerIdle, (ClientData)poolWrk);
+                poolWrk->flags &= ~TPWRK_FLAG_IDLLAT;
+            }
+            if (poolWrk->flags & TPWRK_FLAG_IDLINT) {
+                Tcl_CancelIdleCall(WorkerIdleInt, (ClientData)poolWrk);
+                poolWrk->flags &= ~TPWRK_FLAG_IDLINT;
+            }
+            if (poolWrk->flags & TPWRK_FLAG_IDLTMR) {
+                Tcl_CancelIdleCall(WorkerIdleTOut, (ClientData)poolWrk);
+                poolWrk->flags &= ~TPWRK_FLAG_IDLTMR;
+            }
+        }
+
+        /* if timeout, check min workers, etc. */
+        if (poolWrk->flags & TPWRK_FLAG_IDLTOUT) {
+            Tcl_MutexLock(&tpoolPtr->mutex);
+            /* If worker count at min, leave this one alive */
+            val = (tpoolPtr->numWorkers > tpoolPtr->minWorkers);
+            Tcl_MutexUnlock(&tpoolPtr->mutex);
+            if (val) {
+                break; /* Enough workers, can safely shutdown this one */
+            }
+            _log_debug(" !!! ignore timeout, workers %d ... continue.", tpoolPtr->numWorkers);
+            /* reset timeout and idle timer flag also to generate an idle timer for new timeout again */
+            poolWrk->flags &= ~(TPWRK_FLAG_IDLTOUT|TPWRK_FLAG_IDLTMR);
+        }
+
+        /* repeat wait cycle */
+    }
+
+    _log_debug(" !!! worker shutdown ... ");
+
+    /* mark thread as stopped (if someone wait for worker or check it with "thread::exists") */
+    ThreadReserve(NULL, (Tcl_ThreadId)0, threadTsdPtr, THREAD_RELEASE, 0);
+
+    Tcl_DeleteEventSource(WorkerEventSetupProc, WorkerEventCheckProc, poolWrk);
 
     Tcl_MutexLock(&tpoolPtr->mutex);
-    while (!tpoolPtr->tearDown) {
-        SignalWaiter(tpoolPtr);
-        tpoolPtr->idleWorkers++;
-        rPtr = NULL;
-        tout = 0;
-        while (tpoolPtr->suspend
-               || (!tpoolPtr->tearDown && !tout
-                   && (rPtr = PopWork(tpoolPtr)) == NULL)) {
-            if (tpoolPtr->suspend && rPtr == NULL) {
-                Tcl_ConditionWait(&tpoolPtr->cond, &tpoolPtr->mutex, NULL);
-            } else if (rPtr == NULL) {
-                Tcl_Time t1, t2;
-                Tcl_GetTime(&t1);
-                Tcl_ConditionWait(&tpoolPtr->cond, &tpoolPtr->mutex, idlePtr);
-                Tcl_GetTime(&t2);
-                if (tpoolPtr->idleTime > 0) {
-                    tout = (t2.sec - t1.sec) >= tpoolPtr->idleTime;
-                }
-            }
-        }
-        tpoolPtr->idleWorkers--;
-        if (rPtr == NULL) {
-            if (tpoolPtr->numWorkers > tpoolPtr->minWorkers) {
-                break; /* Enough workers, can safely kill this one */
-            } else {
-                continue; /* Worker count at min, leave this one alive */
-            }
-        } else if (tpoolPtr->tearDown) {
-            PushWork(rPtr, tpoolPtr);
-            break; /* Kill worker because pool is going down */
-        }
-        Tcl_MutexUnlock(&tpoolPtr->mutex);
-        TpoolEval(interp, rPtr->script, rPtr->scriptLen, rPtr);
-        ckfree(rPtr->script);
-        Tcl_MutexLock(&tpoolPtr->mutex);
-        if (!rPtr->detached) {
-            int new;
-            Tcl_SetHashValue(Tcl_CreateHashEntry(&tpoolPtr->jobsDone,
-                                                 (void *)(size_t)rPtr->jobId, &new),
-                             (ClientData)rPtr);
-            SignalWaiter(tpoolPtr);
-        } else {
-            ckfree((char*)rPtr);
-        }
-    }
 
     /*
      * Tear down the worker
      */
+    if (poolWrk->nextIdl)
+        RingDetachIdle(poolWrk);
+    tpoolPtr->stopWorkers++;
+    if (poolWrk->nextWrk)
+        RingDetachWorker(poolWrk);
 
-    if (tpoolPtr->exitScript) {
-        TpoolEval(interp, tpoolPtr->exitScript, -1, NULL);
-    }
-
-    tpoolPtr->numWorkers--;
-    SignalWaiter(tpoolPtr);
     Tcl_MutexUnlock(&tpoolPtr->mutex);
 
- out:
+    /* call exit script, that should also call "update", if some events should be processed */
+    if (tpoolPtr->exitScript) {
+        Tcl_Obj *objPtr = Sv_DuplicateObj(tpoolPtr->exitScript);
+        Tcl_IncrRefCount(objPtr);
+        TpoolEval(interp, objPtr, NULL);
+        Tcl_DecrRefCount(objPtr);
+    }
 
-#ifdef NS_AOLSERVER
-    Ns_TclMarkForDelete(interp);
-    Ns_TclDeAllocateInterp(interp);
-#else
-    Tcl_DeleteInterp(interp);
-#endif
+ end:
+
+    _log_debug(" !!! worker finalization ... ");
     Tcl_ExitThread(0);
 
+     _log_debug(" !!! worker exit. ")
+
     TCL_THREAD_CREATE_RETURN;
+}
+
+/*
+ *----------------------------------------------------------------------
+ */
+static int
+TpoolReloadEvent(Tcl_Event *eventPtr, int mask)
+{
+    TpoolEvent  *poolEvent = (TpoolEvent*)(eventPtr+1);
+    TpoolWorker *poolWrk   = poolEvent->poolWrk;
+    ThreadPool  *tpoolPtr  = poolWrk->tpoolPtr;
+    Tcl_Obj *reloadScript  = (Tcl_Obj*)poolEvent->rPtr;
+
+    /* if worker still attached (alive) */
+    if (poolWrk->nextWrk) {
+
+        Sv_SetDupObj(&poolWrk->idleScript,    tpoolPtr->idleScript);
+        Sv_SetDupObj(&poolWrk->idleIntScript, tpoolPtr->idleIntScript);
+
+        /* execute reload script broadcasted to worker */
+        if (reloadScript) {
+            int ret;
+            Tcl_IncrRefCount(reloadScript);
+            ret = Tcl_EvalObjEx(poolWrk->interp, reloadScript, TCL_EVAL_GLOBAL);
+            if (ret != TCL_OK) {
+                ThreadErrorProc(poolWrk->interp);
+            }
+        }
+    }
+
+    if (reloadScript) {
+        Tcl_DecrRefCount(reloadScript);
+    }
+
+    return 1;
 }
 
 /*
@@ -1294,7 +2713,7 @@ RunStopEvent(eventPtr, mask)
     Tcl_Event *eventPtr;
     int mask;
 {
-    ThreadSpecificData *tsdPtr = TCL_TSD_INIT(&dataKey);
+    TpoolSpecificData *tsdPtr = TPOOL_TSD_INIT();
 
     tsdPtr->stop = 1;
     return 1;
@@ -1364,68 +2783,6 @@ PopWork(tpoolPtr)
 /*
  *----------------------------------------------------------------------
  *
- * PushWaiter --
- *
- *  Adds a waiter thread to the end of the waiters list.
- *
- * Results:
- *  None.
- *
- * Side effects:
- *  None.
- *
- *----------------------------------------------------------------------
- */
-
-static void
-PushWaiter(tpoolPtr)
-    ThreadPool *tpoolPtr;
-{
-    ThreadSpecificData *tsdPtr = TCL_TSD_INIT(&dataKey);
-
-    SpliceIn(tsdPtr->waitPtr, tpoolPtr->waitHead);
-    if (tpoolPtr->waitTail == NULL) {
-        tpoolPtr->waitTail = tsdPtr->waitPtr;
-    }
-}
-
-/*
- *----------------------------------------------------------------------
- *
- * PopWaiter --
- *
- *  Pops the first waiter from the head of the waiters list.
- *
- * Results:
- *  None.
- *
- * Side effects:
- *  None.
- *
- *----------------------------------------------------------------------
- */
-
-static TpoolWaiter*
-PopWaiter(tpoolPtr)
-    ThreadPool *tpoolPtr;
-{
-    TpoolWaiter *waitPtr =  tpoolPtr->waitTail;
-
-    if (waitPtr == NULL) {
-        return NULL;
-    }
-
-    tpoolPtr->waitTail = waitPtr->prevPtr;
-    SpliceOut(waitPtr, tpoolPtr->waitHead);
-
-    waitPtr->prevPtr = waitPtr->nextPtr = NULL;
-
-    return waitPtr;
-}
-
-/*
- *----------------------------------------------------------------------
- *
  * GetTpool
  *
  *  Parses the Tcl threadpool handle and locates the
@@ -1435,7 +2792,7 @@ PopWaiter(tpoolPtr)
  *  Pointer to the threadpool struct or NULL if none found,
  *
  * Side effects:
- *  None.
+ *  Value of objRefCount for returned pool is incremented
  *
  *----------------------------------------------------------------------
  */
@@ -1447,6 +2804,8 @@ GetTpool(tpoolName)
 
     Tcl_MutexLock(&listMutex);
     tpoolPtr = GetTpoolUnl(tpoolName);
+    if (tpoolPtr != NULL)
+        tpoolPtr->objRefCount++;
     Tcl_MutexUnlock(&listMutex);
 
     return tpoolPtr;
@@ -1490,6 +2849,121 @@ GetTpoolUnl (tpoolName)
 }
 
 /*
+ * Type definition.
+ */
+
+Tcl_ObjType TpoolObjType = {
+    "threadpool",          /* name */
+    TpoolObj_FreeInternalRep, /* freeIntRepProc */
+    TpoolObj_DupInternalRep,  /* dupIntRepProc */
+    TpoolObj_UpdateString,    /* updateStringProc */
+    TpoolObj_SetFromAny       /* setFromAnyProc */
+};
+
+/*
+ *----------------------------------------------------------------------
+ */
+static ThreadPool*
+GetTpoolFromObj(interp, objPtr, shutDownLevel)
+    Tcl_Interp *interp;
+    Tcl_Obj    *objPtr;
+    int shutDownLevel;
+{
+    ThreadPool *tpoolPtr;
+    if (objPtr->typePtr != &TpoolObjType &&
+        TpoolObj_SetFromAny(interp, objPtr) != TCL_OK
+    ) {
+        return NULL;
+    }
+
+    tpoolPtr = (ThreadPool*)objPtr->internalRep.twoPtrValue.ptr1;
+
+    if (tpoolPtr->tearDown > shutDownLevel || (!shutDownLevel && tpoolPtr->refCount <= 0)) {
+        if (interp) {
+            Tcl_AppendResult(interp, "threadpool is shut down", NULL);
+            Tcl_SetErrorCode(interp, "TCL", "ESHUTDOWN", NULL);
+        }
+        return NULL;
+    }
+    return tpoolPtr;
+}
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+TpoolObj_DupInternalRep(srcPtr, copyPtr)
+    Tcl_Obj *srcPtr;
+    Tcl_Obj *copyPtr;
+{
+    ThreadPool *tpoolPtr = (ThreadPool*)srcPtr->internalRep.twoPtrValue.ptr1;
+
+    Tcl_MutexLock(&listMutex);
+    tpoolPtr->objRefCount++;
+    Tcl_MutexUnlock(&listMutex);
+    TpoolObj_SetObjIntRep(copyPtr, tpoolPtr);
+}
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+TpoolObj_FreeInternalRep(objPtr)
+    Tcl_Obj *objPtr;
+{
+    ThreadPool *tpoolPtr = (ThreadPool*)objPtr->internalRep.twoPtrValue.ptr1;
+    Tcl_MutexLock(&listMutex);
+    /* decrement reference count of pool */
+    if (--tpoolPtr->objRefCount <= 0) {
+        /* if not reserved also - free it */
+        if (tpoolPtr->refCount <= 0) {
+            TpoolRelease(tpoolPtr);
+        }
+    }
+    Tcl_MutexUnlock(&listMutex);
+    objPtr->typePtr = NULL;
+};
+/*
+ *----------------------------------------------------------------------
+ */
+static int
+TpoolObj_SetFromAny(interp, objPtr)
+    Tcl_Interp *interp;
+    Tcl_Obj    *objPtr;
+{
+    ThreadPool *tpoolPtr;
+    char *tpoolName = objPtr->bytes;
+    if (!tpoolName)
+        tpoolName = Tcl_GetString(objPtr);
+    if (!tpoolName || (tpoolPtr = GetTpool(tpoolName)) == NULL) {
+        if (interp) {
+            Tcl_AppendResult(interp, "can not find threadpool \"",
+                tpoolName ? tpoolName : "", "\"", NULL);
+            Tcl_SetErrorCode(interp, "TCL", "ENOENT", NULL);
+        }
+        return TCL_ERROR;
+    }
+    
+    if (objPtr->typePtr && objPtr->typePtr->freeIntRepProc)
+        objPtr->typePtr->freeIntRepProc(objPtr);
+    TpoolObj_SetObjIntRep(objPtr, tpoolPtr);
+    return TCL_OK;
+};
+/*
+ *----------------------------------------------------------------------
+ */
+static void
+TpoolObj_UpdateString(objPtr)
+    Tcl_Obj  *objPtr;
+{
+    ThreadPool *tpoolPtr = (ThreadPool*)objPtr->internalRep.twoPtrValue.ptr1;
+    char buf[64];
+    int  len = sprintf(buf, "%s%p", TPOOL_HNDLPREFIX, tpoolPtr);
+    objPtr->length = len,
+    objPtr->bytes = ckalloc((size_t)++len);
+    if (objPtr->bytes)
+        memcpy(objPtr->bytes, buf, len);
+}
+
+/*
  *----------------------------------------------------------------------
  *
  * TpoolEval
@@ -1505,42 +2979,28 @@ GetTpoolUnl (tpoolName)
  *----------------------------------------------------------------------
  */
 static int
-TpoolEval(interp, script, scriptLen, rPtr)
+TpoolEval(interp, script, rPtr)
     Tcl_Interp *interp;
-    char *script;
-    int scriptLen;
+    Tcl_Obj *script;
     TpoolResult *rPtr;
 {
     int ret;
-    size_t reslen;
-    const char *result;
-    const char *errorCode, *errorInfo;
 
-    ret = Tcl_EvalEx(interp, script, scriptLen, TCL_EVAL_GLOBAL);
+    /* prevent wrap return code, should be possible to return to the caller thread: return = 2, break = 3, etc... */
+    ThreadIncrNumLevels(interp, 1);
+    /* todo: make possible to eval in current context/scope/namesapace (not global) */
+    ret = Tcl_EvalObjEx(interp, script, TCL_EVAL_GLOBAL);
+    ThreadIncrNumLevels(interp, -1);
+
+    /* process error with error proc or set it to result pointer */
     if (rPtr == NULL || rPtr->detached) {
+        if (ret != TCL_OK) {
+            ThreadErrorProc(interp);
+        }
         return ret;
-    }
-    rPtr->retcode = ret;
-    if (ret == TCL_ERROR) {
-        errorCode = Tcl_GetVar2(interp, "errorCode", NULL, TCL_GLOBAL_ONLY);
-        errorInfo = Tcl_GetVar2(interp, "errorInfo", NULL, TCL_GLOBAL_ONLY);
-        if (errorCode != NULL) {
-            rPtr->errorCode = ckalloc(1 + strlen(errorCode));
-            strcpy(rPtr->errorCode, errorCode);
-        }
-        if (errorInfo != NULL) {
-            rPtr->errorInfo = ckalloc(1 + strlen(errorInfo));
-            strcpy(rPtr->errorInfo, errorInfo);
-        }
-    }
-
-    result = Tcl_GetString(Tcl_GetObjResult(interp));
-    reslen = Tcl_GetObjResult(interp)->length;
-
-    if (reslen == 0) {
-        rPtr->result = threadEmptyResult;
     } else {
-        rPtr->result = strcpy(ckalloc(1 + reslen), result);
+        Tcl_SetObjRef(rPtr->resultObj,
+            ThreadGetReturnInterpStateObj(interp, ret));
     }
 
     return ret;
@@ -1561,40 +3021,23 @@ TpoolEval(interp, script, scriptLen, rPtr)
  *
  *----------------------------------------------------------------------
  */
-static void
+static int
 SetResult(interp, rPtr)
     Tcl_Interp *interp;
     TpoolResult *rPtr;
 {
-    if (rPtr->retcode == TCL_ERROR) {
-        if (rPtr->errorCode) {
-            if (interp) {
-                Tcl_SetObjErrorCode(interp,Tcl_NewStringObj(rPtr->errorCode,-1));
-            }
-            ckfree(rPtr->errorCode);
-            rPtr->errorCode = NULL;
-        }
-        if (rPtr->errorInfo) {
-            if (interp) {
-                Tcl_AddErrorInfo(interp, rPtr->errorInfo);
-            }
-            ckfree(rPtr->errorInfo);
-            rPtr->errorInfo = NULL;
-        }
-    }
-    if (rPtr->result) {
-        if (rPtr->result == threadEmptyResult) {
-            if (interp) {
-                Tcl_ResetResult(interp);
-            }
+    if (rPtr->resultObj) {
+        int code;
+        if (interp) {
+            code = ThreadRestoreInterpStateFromObj(interp, rPtr->resultObj);
         } else {
-            if (interp) {
-                Tcl_SetObjResult(interp, Tcl_NewStringObj(rPtr->result,-1));
-            }
-            ckfree(rPtr->result);
-            rPtr->result = NULL;
+            code = ThreadGetStatusOfInterpStateObj(rPtr->resultObj);
         }
+        Tcl_DecrRefCount(rPtr->resultObj);
+        rPtr->resultObj = NULL;
+        return code;
     }
+    return TCL_OK;
 }
 
 /*
@@ -1640,86 +3083,115 @@ static int
 TpoolRelease(tpoolPtr)
     ThreadPool *tpoolPtr;
 {
-    ThreadSpecificData *tsdPtr = TCL_TSD_INIT(&dataKey);
-    TpoolResult *rPtr;
-    Tcl_HashEntry *hPtr;
-    Tcl_HashSearch search;
+        TpoolSpecificData *tsdPtr;
+        TpoolResult *rPtr;
+        Tcl_HashEntry *hPtr;
+        Tcl_HashSearch search;
 
-    if (--tpoolPtr->refCount > 0) {
-        return tpoolPtr->refCount;
-    }
+    if (tpoolPtr->refCount > 0 && tpoolPtr->tearDown == 0) {
 
-    /*
-     * Pool is going away; remove from the list of pools,
-     */
-
-    SpliceOut(tpoolPtr, tpoolList);
-    InitWaiter();
-
-    /*
-     * Signal and wait for all workers to die.
-     */
-
-    Tcl_MutexLock(&tpoolPtr->mutex);
-    tpoolPtr->tearDown = 1;
-    while (tpoolPtr->numWorkers > 0) {
-        PushWaiter(tpoolPtr);
-        Tcl_ConditionNotify(&tpoolPtr->cond);
-        Tcl_MutexUnlock(&tpoolPtr->mutex);
-        tsdPtr->stop = -1;
-        while(tsdPtr->stop == -1) {
-            Tcl_DoOneEvent(TCL_ALL_EVENTS);
+        _log_debug(" !!! pool master: release %d", tpoolPtr->refCount);
+        if (--tpoolPtr->refCount > 0) {
+            return tpoolPtr->refCount;
         }
+
+        /*
+         * Pool is going away; remove from the list of pools,
+         */
+
+        tsdPtr = TPOOL_TSD_INIT();
+
+        SpliceOut(tpoolPtr, tpoolList);
+
+        tpoolPtr->waiterId = Tcl_GetCurrentThread();
+
+        /*
+         * Signal and wait for all workers to die.
+         */
+
+        tpoolPtr->tearDown = 1;
         Tcl_MutexLock(&tpoolPtr->mutex);
-    }
-    Tcl_MutexUnlock(&tpoolPtr->mutex);
-
-    /*
-     * Tear down the pool structure
-     */
-
-    if (tpoolPtr->initScript) {
-        ckfree(tpoolPtr->initScript);
-    }
-    if (tpoolPtr->exitScript) {
-        ckfree(tpoolPtr->exitScript);
-    }
-
-    /*
-     * Cleanup completed but not collected jobs
-     */
-
-    hPtr = Tcl_FirstHashEntry(&tpoolPtr->jobsDone, &search);
-    while (hPtr != NULL) {
-        rPtr = (TpoolResult*)Tcl_GetHashValue(hPtr);
-        if (rPtr->result && rPtr->result != threadEmptyResult) {
-            ckfree(rPtr->result);
+        /* if was suspended - resume, otherwise wake up workers */
+        if (tpoolPtr->suspend) {
+            TpoolResume(NULL, tpoolPtr);
+        } else {
+            /* first all idle workers (break Tcl_DoOneEvent) */
+            SignalWorker(tpoolPtr, 0x7fffffff, TPOOL_SVC_EVENT, TCL_QUEUE_HEAD);
         }
-        if (rPtr->retcode == TCL_ERROR) {
-            if (rPtr->errorInfo) {
-                ckfree(rPtr->errorInfo);
+        /* second all working threads (+ wait to their end) */
+        while (tpoolPtr->numWorkers > 0 || tpoolPtr->stopWorkers > 0) {
+            Tcl_ConditionNotify(&tpoolPtr->cond);
+            tsdPtr->stop = -1;
+            Tcl_MutexUnlock(&tpoolPtr->mutex);
+            while (
+                tsdPtr->stop == -1 && 
+                (tpoolPtr->numWorkers > 0 || tpoolPtr->stopWorkers > 0)
+            ) {
+                _log_debug(" !!! wait for workers: (%d)/%d/%d", 
+                    tpoolPtr->idleWorkers, tpoolPtr->numWorkers, tpoolPtr->stopWorkers);
+                Tcl_DoOneEvent(TCL_ALL_EVENTS);
             }
-            if (rPtr->errorCode) {
-                ckfree(rPtr->errorCode);
-            }
+            Tcl_MutexLock(&tpoolPtr->mutex);
         }
-        ckfree((char*)rPtr);
-        Tcl_DeleteHashEntry(hPtr);
-        hPtr = Tcl_NextHashEntry(&search);
-    }
-    Tcl_DeleteHashTable(&tpoolPtr->jobsDone);
 
-    /*
-     * Cleanup jobs posted but never completed.
-     */
+        tpoolPtr->waiterId = (Tcl_ThreadId)NULL;
 
-    for (rPtr = tpoolPtr->workHead; rPtr; rPtr = rPtr->nextPtr) {
-        ckfree(rPtr->script);
-        ckfree((char*)rPtr);
+        _log_debug(" !!! pool master: tear down the pool structure");
+        /*
+         * Tear down the pool structure
+         */
+
+        tpoolPtr->tearDown = 2;
+        
+        if (tpoolPtr->initScript) {
+            Tcl_DecrRefCount(tpoolPtr->initScript);
+            tpoolPtr->initScript = NULL;
+        }
+        if (tpoolPtr->exitScript) {
+            Tcl_DecrRefCount(tpoolPtr->exitScript);
+            tpoolPtr->exitScript = NULL;
+        }
+        if (tpoolPtr->idleScript) {
+            Tcl_DecrRefCount(tpoolPtr->idleScript);
+            tpoolPtr->idleScript = NULL;
+        }
+        if (tpoolPtr->idleIntScript) {
+            Tcl_DecrRefCount(tpoolPtr->idleIntScript);
+            tpoolPtr->idleIntScript = NULL;
+        }
+
+        /*
+         * Cleanup completed but not collected jobs
+         */
+
+        hPtr = Tcl_FirstHashEntry(&tpoolPtr->jobsDone, &search);
+        while (hPtr != NULL) {
+            rPtr = (TpoolResult*)Tcl_GetHashValue(hPtr);
+            SetResult(NULL, rPtr);
+            ckfree((char*)rPtr);
+            Tcl_DeleteHashEntry(hPtr);
+            hPtr = Tcl_NextHashEntry(&search);
+        }
+        Tcl_DeleteHashTable(&tpoolPtr->jobsDone);
+
+        /*
+         * Cleanup jobs posted but never completed.
+         */
+
+        for (rPtr = tpoolPtr->workHead; rPtr; rPtr = rPtr->nextPtr) {
+            Tcl_DecrRefCount(rPtr->script);
+            ckfree((char*)rPtr);
+        }
+        Tcl_MutexUnlock(&tpoolPtr->mutex);
+        Tcl_MutexFinalize(&tpoolPtr->mutex);
+        Tcl_MutexFinalize(&tpoolPtr->startMutex);
+        Tcl_ConditionFinalize(&tpoolPtr->cond);
     }
-    Tcl_MutexFinalize(&tpoolPtr->mutex);
-    Tcl_ConditionFinalize(&tpoolPtr->cond);
-    ckfree((char*)tpoolPtr);
+
+    /* remove tpoolPtr only if the last reference everywhere */
+    if (tpoolPtr->refCount == 0 && tpoolPtr->objRefCount == 0) {
+        ckfree((char*)tpoolPtr);
+    }
 
     return 0;
 }
@@ -1733,7 +3205,7 @@ TpoolRelease(tpoolPtr)
  *  the pool work queue.
  *
  * Results:
- *  Value of the suspend flag (1 always).
+ *  Value of the suspend flag (TPOOL_SUSPEND_JOBS | TPOOL_SUSPEND_FULL).
  *
  * Side effects:
  *  During the suspended state, pool worker threads wlll not timeout
@@ -1742,11 +3214,26 @@ TpoolRelease(tpoolPtr)
  *----------------------------------------------------------------------
  */
 static void
-TpoolSuspend(tpoolPtr)
+TpoolSuspend(tpoolPtr, mode)
     ThreadPool *tpoolPtr;
+    int mode;
 {
     Tcl_MutexLock(&tpoolPtr->mutex);
-    tpoolPtr->suspend = 1;
+    Tcl_MutexLock(&tpoolPtr->startMutex);
+    if (tpoolPtr->suspend != mode) {
+        /* other suspend mode - notify workers */
+        if (tpoolPtr->suspend) {
+            tpoolPtr->suspend = mode;
+            Tcl_ConditionNotify(&tpoolPtr->cond);
+        } else {
+            tpoolPtr->suspend = mode;
+        }
+        /* for mode "full" we should be sure are workers leaves waiting Tcl_DoOneEvent */
+        if (mode == TPOOL_SUSPEND_FULL) {
+            SignalWorker(tpoolPtr, 0x7fffffff, TPOOL_SVC_EVENT, TCL_QUEUE_HEAD);
+        }
+    }
+    Tcl_MutexUnlock(&tpoolPtr->startMutex);
     Tcl_MutexUnlock(&tpoolPtr->mutex);
 }
 
@@ -1767,12 +3254,54 @@ TpoolSuspend(tpoolPtr)
  *----------------------------------------------------------------------
  */
 static void
-TpoolResume(tpoolPtr)
+TpoolResume(interp, tpoolPtr)
+    Tcl_Interp *interp;
     ThreadPool *tpoolPtr;
 {
+    /* worker use "startMutex" for conditional wait for resume */
     Tcl_MutexLock(&tpoolPtr->mutex);
+    Tcl_MutexLock(&tpoolPtr->startMutex);
+
     tpoolPtr->suspend = 0;
     Tcl_ConditionNotify(&tpoolPtr->cond);
+
+    /* if some worker goes down - start again ... */
+    if (
+        !tpoolPtr->tearDown 
+    ) {
+        int count = tpoolPtr->minWorkers - tpoolPtr->numWorkers;
+        if (count <= 0 && HasWork(tpoolPtr))
+            count = 1;
+        while (
+            count-- > 0
+         && tpoolPtr->numWorkers < tpoolPtr->maxWorkers
+        ) {
+            int ret;
+            ret = CreateWorker(interp, tpoolPtr, 0);
+            if (ret != TCL_OK) {
+                ThreadErrorProc(interp);
+                break;
+            }
+        }
+    }
+
+    /* Wake all workers, that can have jobs to be processed */
+    if (HasWork(tpoolPtr)) {
+        /* signal using create events */
+        SignalWorker(tpoolPtr, 0x7fffffff, TPOOL_SVC_EVENT, TCL_QUEUE_TAIL);
+    } else {
+        /* because could be distributed works was refused, just notify instead of signal with event */
+        TpoolWorker *poolWrk, *lastHead;
+        poolWrk = lastHead = tpoolPtr->workerRing;
+        while (poolWrk) {
+            Tcl_ThreadAlert(poolWrk->threadId);
+            poolWrk = poolWrk->nextWrk;
+            if (poolWrk == lastHead)
+                break;
+        }
+    }
+
+    Tcl_MutexUnlock(&tpoolPtr->startMutex);
     Tcl_MutexUnlock(&tpoolPtr->mutex);
 }
 
@@ -1792,75 +3321,17 @@ TpoolResume(tpoolPtr)
  *----------------------------------------------------------------------
  */
 static void
-SignalWaiter(tpoolPtr)
-    ThreadPool *tpoolPtr;
+SignalWaiter(tpoolPtr, threadId)
+    ThreadPool  *tpoolPtr;
+    Tcl_ThreadId threadId;
 {
-    TpoolWaiter *waitPtr;
     Tcl_Event *evPtr;
-
-    waitPtr = PopWaiter(tpoolPtr);
-    if (waitPtr == NULL) {
-        return;
-    }
 
     evPtr = (Tcl_Event*)ckalloc(sizeof(Tcl_Event));
     evPtr->proc = RunStopEvent;
 
-    Tcl_ThreadQueueEvent(waitPtr->threadId,(Tcl_Event*)evPtr,TCL_QUEUE_TAIL);
-    Tcl_ThreadAlert(waitPtr->threadId);
-}
-
-/*
- *----------------------------------------------------------------------
- *
- * InitWaiter --
- *
- *  Setup poster thread to be able to wait in the event loop.
- *
- * Results:
- *  None.
- *
- * Side effects:
- *  None.
- *
- *----------------------------------------------------------------------
- */
-static void
-InitWaiter ()
-{
-    ThreadSpecificData *tsdPtr = TCL_TSD_INIT(&dataKey);
-
-    if (tsdPtr->waitPtr == NULL) {
-        tsdPtr->waitPtr = (TpoolWaiter*)ckalloc(sizeof(TpoolWaiter));
-        tsdPtr->waitPtr->prevPtr  = NULL;
-        tsdPtr->waitPtr->nextPtr  = NULL;
-        tsdPtr->waitPtr->threadId = Tcl_GetCurrentThread();
-        Tcl_CreateThreadExitHandler(ThrExitHandler, (ClientData)tsdPtr);
-    }
-}
-
-/*
- *----------------------------------------------------------------------
- *
- * ThrExitHandler --
- *
- *  Performs cleanup when a caller (poster) thread exits.
- *
- * Results:
- *  None.
- *
- * Side effects:
- *  None.
- *
- *----------------------------------------------------------------------
- */
-static void
-ThrExitHandler(clientData)
-    ClientData clientData;
-{
-    ThreadSpecificData *tsdPtr = (ThreadSpecificData *)clientData;
-
-    ckfree((char*)tsdPtr->waitPtr);
+    Tcl_ThreadQueueEvent(threadId,(Tcl_Event*)evPtr,TCL_QUEUE_TAIL);
+    Tcl_ThreadAlert(threadId);
 }
 
 /*
@@ -1927,6 +3398,9 @@ Tpool_Init (interp)
     TCL_CMD(interp, TPOOL_CMD_PREFIX"release",  TpoolReleaseObjCmd);
     TCL_CMD(interp, TPOOL_CMD_PREFIX"suspend",  TpoolSuspendObjCmd);
     TCL_CMD(interp, TPOOL_CMD_PREFIX"resume",   TpoolResumeObjCmd);
+    TCL_CMD(interp, TPOOL_CMD_PREFIX"reload",   TpoolReloadObjCmd);
+
+    TCL_CMD(interp, THREAD_CMD_PREFIX"svc",     TpoolWorkerServiceCmd);
 
     if (initialized == 0) {
         Tcl_MutexLock(&listMutex);

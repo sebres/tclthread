@@ -8,9 +8,12 @@
 
 LANGUAGE 0x9, 0x1    /* LANG_ENGLISH, SUBLANG_DEFAULT */
 
+#define MOD_RELEASE_LEVEL 3
+#define MOD_RELEASE "mod." STRINGIFY(MOD_RELEASE_LEVEL)
+
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION    PACKAGE_MAJOR,PACKAGE_MINOR,0,0
- PRODUCTVERSION PACKAGE_MAJOR,PACKAGE_MINOR,0,0
+ FILEVERSION    PACKAGE_MAJOR,PACKAGE_MINOR,PACKAGE_RELEASE,MOD_RELEASE_LEVEL
+ PRODUCTVERSION PACKAGE_MAJOR,PACKAGE_MINOR,PACKAGE_RELEASE,0
  FILEFLAGSMASK  0x3fL
 #if DEBUG
  FILEFLAGS 0x1L
@@ -25,18 +28,19 @@ BEGIN
     BEGIN
         BLOCK "040904b0" /* LANG_ENGLISH/SUBLANG_ENGLISH_US, Unicode CP */
         BEGIN
-            VALUE "FileDescription", "Threading extension library for Tcl\0"
+            VALUE "FileDescription", "Threading extension library for Tcl (" MOD_RELEASE ")\0"
 #if DEBUG
             VALUE "OriginalFilename", "thread" STRINGIFY(JOIN(PACKAGE_MAJOR,PACKAGE_MINOR)) "d.dll\0"
 #else
             VALUE "OriginalFilename", "thread" STRINGIFY(JOIN(PACKAGE_MAJOR,PACKAGE_MINOR)) ".dll\0"
 #endif
             VALUE "CompanyName", "NONE! Open-sourced with no owner\0"
-            VALUE "FileVersion", PACKAGE_VERSION
+            VALUE "FileVersion", PACKAGE_VERSION " (" MOD_RELEASE ")\0"
             VALUE "LegalCopyright", "Under BSD license\0"
             VALUE "ProductName", "Tcl for Windows\0"
-            VALUE "ProductVersion", PACKAGE_VERSION
+            VALUE "ProductVersion", PACKAGE_VERSION " (" MOD_RELEASE ")\0"
             VALUE "Authors", "Brent Welch,\r\n" "Andreas Kupries, \r\n" "David Gravereaux,\r\n" "Zoran Vasiljevic" "\0"
+            VALUE "Modification", "(" MOD_RELEASE ")" " \251 2005-2014 by Serg G. Brester (sebres.de)\0"
         END
     END
     BLOCK "VarFileInfo"

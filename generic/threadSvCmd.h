@@ -212,6 +212,27 @@ Sv_PutContainer(Tcl_Interp*, Container*, int);
 
 MODULE_SCOPE Tcl_Obj* Sv_DuplicateObj(Tcl_Obj*);
 
+static __forceinline Tcl_Obj *
+Sv_DupIncrObj(Tcl_Obj *objPtr)
+{
+    if (objPtr != NULL) {
+        objPtr = Sv_DuplicateObj(objPtr);
+        Tcl_IncrRefCount(objPtr);
+    }
+    return objPtr;
+}
+static __forceinline void
+Sv_SetDupObj(Tcl_Obj **trgPtr, Tcl_Obj *objPtr)
+{
+    Tcl_Obj *orgObj = *trgPtr;
+    if (orgObj != objPtr) {
+        *trgPtr = Sv_DupIncrObj(objPtr);
+        if (orgObj) {
+            Tcl_DecrRefCount(orgObj);
+        }
+    }
+}
+
 #endif /* _SV_H_ */
 
 /* EOF $RCSfile: threadSvCmd.h,v $ */

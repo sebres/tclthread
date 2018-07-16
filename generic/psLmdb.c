@@ -179,7 +179,7 @@ ps_lmdb_open(
 
     Tcl_DStringInit(&toext);
     ext = Tcl_UtfToExternalDString(NULL, path, strlen(path), &toext);
-    ctx->err = mdb_env_open(ctx->env, ext, MDB_NOSUBDIR|MDB_NOLOCK, 0666);
+    ctx->err = mdb_env_open(ctx->env, ext, MDB_NOSUBDIR|MDB_NOSYNC, 0666);
     Tcl_DStringFree(&toext);
 
     if (ctx->err)

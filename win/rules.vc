@@ -191,9 +191,14 @@ COMPILERFLAGS   = $(COMPILERFLAGS) -QIA64_Bx
 !endif
 !endif
 
+# Prevents "LNK1561: entry point must be defined" error compiling from VS-IDE:
+!ifndef LINKER_TESTFLAGS
+LINKER_TESTFLAGS = /DLL /NOENTRY /OUT:nmhlp-out.txt
+!endif
+
 !if "$(MACHINE)" == "IX86"
 ### test for -align:4096, when align:512 will do.
-!if [nmakehlp -l -opt:nowin98]
+!if [nmakehlp -l -opt:nowin98 $(LINKER_TESTFLAGS)]
 !message *** Linker has 'Win98 alignment problem'
 ALIGN98_HACK	= 1
 !else
@@ -206,7 +211,7 @@ ALIGN98_HACK	= 0
 
 LINKERFLAGS     =
 
-!if [nmakehlp -l -ltcg]
+!if [nmakehlp -l -ltcg $(LINKER_TESTFLAGS)]
 LINKERFLAGS     =-ltcg
 !endif
 
@@ -315,6 +320,7 @@ TCL_USE_STATIC_PACKAGES = 0
 #----------------------------------------
 SUFX	    = sgx
 
+!message *** Debug: '$(DEBUG)'
 !if $(DEBUG)
 BUILDDIRTOP = Debug
 !else
@@ -420,11 +426,14 @@ WARNINGS		    = $(WARNINGS) -Wp64
 !endif
 !endif
 
+
+LINKERFLAGS = $(LINKERFLAGS) $(ADDLINKOPTS)
+
 #----------------------------------------------------------
 # Set our defines now armed with our options.
 #----------------------------------------------------------
 
-OPTDEFINES	= -DTCL_CFGVAL_ENCODING=$(CFG_ENCODING) -DSTDC_HEADERS
+OPTDEFINES	= -DTCL_CFGVAL_ENCODING=$(CFG_ENCODING) -DSTDC_HEADERS $(ADDOPTDEFINES)
 
 !if $(TCL_MEM_DEBUG)
 OPTDEFINES	= $(OPTDEFINES) -DTCL_MEM_DEBUG

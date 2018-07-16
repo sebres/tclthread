@@ -659,6 +659,7 @@ FreeKeyedListInternalRep (keylPtr)
     Tcl_Obj *keylPtr;
 {
     FreeKeyedListData(keylPtr->internalRep.twoPtrValue.ptr1);
+    keylPtr->typePtr = NULL;
 }
 
 /*-----------------------------------------------------------------------------

@@ -170,6 +170,7 @@ DLLOBJS = \
 	$(TMP_DIR)\threadSpCmd.obj \
 	$(TMP_DIR)\threadPoolCmd.obj \
 	$(TMP_DIR)\psGdbm.obj \
+	$(TMP_DIR)\psLmdb.obj \
 	$(TMP_DIR)\threadSvListCmd.obj \
 	$(TMP_DIR)\threadSvKeylistCmd.obj \
 	$(TMP_DIR)\tclXkeylist.obj \
@@ -409,6 +410,7 @@ $<
 		-DDEBUG=$(DEBUG) \
 		-DPACKAGE_MAJOR=$(PACKAGE_MAJOR) \
 		-DPACKAGE_MINOR=$(PACKAGE_MINOR) \
+		-DPACKAGE_RELEASE=$(PACKAGE_RELEASE) \
 		-DPACKAGE_VERSION=\"$(PACKAGE_VERSION)\" \
 !if $(DEBUG)
 	-d DEBUG \
@@ -431,6 +433,8 @@ $<
 
 #{$(WINDIR)}.c{$(TMP_DIR)}.obj ::
 $(GENERICDIR)\psGdbm.c: $(GENERICDIR)\psGdbm.h
+$(GENERICDIR)\psLmdb.c: $(GENERICDIR)\psLmdb.h
+$(GENERICDIR)\threadCmd.c : $(GENERICDIR)\tclThreadInt.h
 $(GENERICDIR)\threadSpCmd.c : $(GENERICDIR)\tclThreadInt.h
 $(GENERICDIR)\threadSvCmd.c : $(GENERICDIR)\tclThreadInt.h
 $(GENERICDIR)\threadPoolCmd.c : $(GENERICDIR)\tclThreadInt.h
