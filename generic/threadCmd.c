@@ -130,7 +130,7 @@ typedef struct ThreadSpecificData {
 static Tcl_ThreadDataKey dataKey;
 
 #ifndef TCL_TSD_INIT
-__forceinline ThreadSpecificData *
+static inline ThreadSpecificData *
 TCL_TSD_INIT(int autoCreate)
 {
     ThreadSpecificData **tsdPtrPtr;
@@ -147,7 +147,7 @@ TCL_TSD_INIT(int autoCreate)
     // _log(" !!! tsd ++ %p", *tsdPtrPtr);
     return *tsdPtrPtr;
 }
-__forceinline void
+static inline void
 TCL_TSD_SET(ThreadSpecificData *tsdPtr)
 {
     ThreadSpecificData **tsdPtrPtr;
@@ -156,7 +156,7 @@ TCL_TSD_SET(ThreadSpecificData *tsdPtr)
         (&dataKey),sizeof(ThreadSpecificData*));
     *tsdPtrPtr = tsdPtr;
 }
-__forceinline void
+static inline void
 TCL_TSD_REMOVE(ThreadSpecificData *tsdPtr)
 {
     // _log(" !!! tsd -- %p", tsdPtr);
@@ -366,8 +366,10 @@ ThreadEventProc(Tcl_Event *evPtr,
 static int
 ThreadWait(Tcl_Interp *interp);
 
+#if 0
 static int
 ThreadExists(Tcl_ThreadId id, ThreadSpecificData *tsdPtr, int shutDownLevel);
+#endif
 
 #define THREADLIST_ALL     1
 #define THREADLIST_NOSELF  2
@@ -438,7 +440,7 @@ ThreadObj_UpdateString(Tcl_Obj *objPtr);
     objPtr->internalRep.twoPtrValue.ptr2 = thrId, \
     objPtr->typePtr = &ThreadObjType;
 
-__forceinline void
+static inline void
 ThreadObj_InitLocalObj(ThreadSpecificData *tsdPtr)
 {
     if (!tsdPtr->threadObjPtr) {
@@ -931,9 +933,9 @@ ThreadIdObjCmd(dummy, interp, objc, objv)
         if (!threadIdHexObj) {
             Tcl_ThreadId thrId = Tcl_GetCurrentThread();
             if (thrId >= 0 && thrId <= (Tcl_ThreadId)0xffff) {
-                threadIdHexObj = Tcl_ObjPrintf("%04X", (int)thrId);
+                threadIdHexObj = Tcl_ObjPrintf("%04X", (int)(size_t)thrId);
             } else {
-                threadIdHexObj = Tcl_ObjPrintf("%p", thrId);
+                threadIdHexObj = Tcl_ObjPrintf("%04" TCL_LL_MODIFIER "X", (Tcl_WideInt)thrId);
             }
             Tcl_InitObjRef(tsdPtr->threadIdHexObj, threadIdHexObj);
         }
@@ -1022,7 +1024,10 @@ static void
 ThreadSendFreeClientDataObj(ClientData ptr)
 {
     ThreadSendData *sendPtr = (ThreadSendData*)ptr;
-    Tcl_UnsetObjRef((Tcl_Obj*)sendPtr->clientData);
+    if (sendPtr->clientData) {
+        Tcl_DecrRefCount((Tcl_Obj*)sendPtr->clientData);
+        sendPtr->clientData = NULL;
+    }
 }
 
 /*
@@ -1938,13 +1943,6 @@ ThreadSendEval(interp, clientData)
     Tcl_Obj *script = (Tcl_Obj*)sendPtr->clientData;
     int code;
 
-/*
-    int len;
-    char * scrStr = Tcl_GetStringFromObj(script, &len);
-    /* todo: replace with Tcl_EvalObjEx if tcl-bug fixed (return code should not be wrapped return = 2, break = 3, etc...) * /
-    return Tcl_EvalEx(interp, scrStr, len, TCL_EVAL_GLOBAL);
-*/
-
     /* prevent wrap return code, should be possible to return to the caller thread: return = 2, break = 3, etc... */
     ThreadIncrNumLevels(interp, 1);
     /* todo: make possible to eval in current context/scope/namesapace (not global) */
@@ -1979,7 +1977,6 @@ ThreadClbkSetVar(interp, clientData)
     Tcl_Obj *var = (Tcl_Obj*)clbkPtr->clientData;
     Tcl_Obj *valObj = clbkPtr->resultObj;
     int code = TCL_OK;
-    int rc = TCL_OK;
 
 
     /*
@@ -2029,7 +2026,10 @@ ThreadClbkFree(clientData)
 {
     ThreadClbkData *clbkPtr = (ThreadClbkData*)clientData;
     /* tcl object with variable reference: */
-    Tcl_UnsetObjRef((Tcl_Obj*)clbkPtr->clientData);
+    if (clbkPtr->clientData) {
+        Tcl_DecrRefCount((Tcl_Obj*)clbkPtr->clientData);
+        clbkPtr->clientData = NULL;
+    }
     /* tcl object with back reference (result of error state): */
     Tcl_UnsetObjRef(clbkPtr->resultObj);
 }
@@ -2440,6 +2440,7 @@ done:
     return listPtr;
 }
 
+#if 0
 /*
  *----------------------------------------------------------------------
  *
@@ -2476,6 +2477,7 @@ ThreadExists(thrId, tsdPtr, shutDownLevel)
 
     return tsdPtr != NULL;
 }
+#endif
 
 /*
  *----------------------------------------------------------------------
@@ -3514,6 +3516,7 @@ ThreadEventProc(evPtr, mask)
 static Tcl_Obj *
 ThreadGetResult(interp, code)
     Tcl_Interp *interp;
+    int code;
 {
     register Tcl_Obj * resultObj;
     if (interp != NULL) {
@@ -3842,7 +3845,7 @@ ThreadDeleteEvent(eventPtr, clientData)
              */
 
             Tcl_SetObjRef(resultPtr->resultObj,
-                ThreadErrorInterpStateObj(TCL_ERROR, "target thread died", "TCL ESHUTDOWN"));
+                ThreadErrorInterpStateObj(TCL_ERROR, "target thread died", die_ec));
             Tcl_ConditionNotify(&resultPtr->done);
         }
 
@@ -3873,7 +3876,7 @@ ThreadDeleteEvent(eventPtr, clientData)
              */
 
             Tcl_SetObjRef(resultPtr->resultMsg,
-                ThreadErrorInterpStateObj(TCL_ERROR, "transfer failed: target thread died", "TCL ESHUTDOWN"));
+                ThreadErrorInterpStateObj(TCL_ERROR, "transfer failed: target thread died", die_ec));
             resultPtr->resultCode = TCL_ERROR;
             Tcl_ConditionNotify(&resultPtr->done);
         
@@ -4060,9 +4063,9 @@ ThreadGetHandle(thrId, handlePtr)
     char *handlePtr;
 {
     if (thrId >= 0 && thrId <= (Tcl_ThreadId)0xffff) {
-        return sprintf(handlePtr, THREAD_HNDLPREFIX"%04X", (int)thrId);
+        return sprintf(handlePtr, THREAD_HNDLPREFIX"%04X", (int)(size_t)thrId);
     } else {
-        return sprintf(handlePtr, THREAD_HNDLPREFIX"%p", thrId);
+        return sprintf(handlePtr, THREAD_HNDLPREFIX"%04" TCL_LL_MODIFIER "X", (Tcl_WideInt)thrId);
     }
 }
 

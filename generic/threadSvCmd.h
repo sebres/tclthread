@@ -212,7 +212,7 @@ Sv_PutContainer(Tcl_Interp*, Container*, int);
 
 MODULE_SCOPE Tcl_Obj* Sv_DuplicateObj(Tcl_Obj*);
 
-static __forceinline Tcl_Obj *
+static inline Tcl_Obj *
 Sv_DupIncrObj(Tcl_Obj *objPtr)
 {
     if (objPtr != NULL) {
@@ -221,7 +221,7 @@ Sv_DupIncrObj(Tcl_Obj *objPtr)
     }
     return objPtr;
 }
-static __forceinline void
+static inline void
 Sv_SetDupObj(Tcl_Obj **trgPtr, Tcl_Obj *objPtr)
 {
     Tcl_Obj *orgObj = *trgPtr;

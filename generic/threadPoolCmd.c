@@ -250,7 +250,7 @@ TpoolObj_UpdateString(Tcl_Obj *objPtr);
 /*
  *----------------------------------------------------------------------
  */
-static __forceinline void
+static inline void
 SignalWorkerInner(poolWrk, eventProc, rPtr, queuepos)
     TpoolWorker *poolWrk;
     Tcl_EventProc *eventProc;
@@ -740,7 +740,6 @@ TpoolPostObjCmd(dummy, interp, objc, objv)
     Tcl_WideInt jobId = 0;
     int ii, detached = 0, nostart = 0, distribute = 0, broadcast = 0;
     Tcl_QueuePosition queuepos = TCL_QUEUE_TAIL;
-    size_t len;
     Tcl_Obj  *script;
     TpoolResult *rPtr;
     ThreadPool  *tpoolPtr;
@@ -785,7 +784,6 @@ TpoolPostObjCmd(dummy, interp, objc, objv)
         return TCL_ERROR;
     }
     script = objv[ii+1];
-    len = objv[ii+1]->length;
 
     /*
      * See if any worker available to run the job.
@@ -1559,8 +1557,9 @@ TpoolNamesObjCmd(dummy, interp, objc, objv)
         Tcl_SetObjResult(interp, listObj);
         return TCL_OK;
     }
-
+#if 0
  usage:
+#endif
     Tcl_WrongNumArgs(interp, 1, objv,
         "?tpoolId?"
     );
@@ -2086,7 +2085,6 @@ static void
 WorkerIdle(ClientData clientData) 
 {
     TpoolWorker  *poolWrk = (TpoolWorker*)clientData;
-    ThreadPool   *tpoolPtr = poolWrk->tpoolPtr;
 
     _log_debug(" !!! idle event (latency) ... ");
     if (poolWrk->idleScript != NULL && (poolWrk->flags & TPWRK_FLAG_IDLE)) {
@@ -2108,7 +2106,6 @@ static void
 WorkerIdleInt(ClientData clientData) 
 {
     TpoolWorker  *poolWrk = (TpoolWorker*)clientData;
-    ThreadPool   *tpoolPtr = poolWrk->tpoolPtr;
 
     _log_debug(" !!! idle interval event ... ");
     if (poolWrk->idleIntScript != NULL && (poolWrk->flags & TPWRK_FLAG_IDLE)) {
@@ -2154,8 +2151,9 @@ WorkerSetMaxBlockTime(Tcl_Time *nowTime, Tcl_Time *startTime, Tcl_Time *offs)
  *----------------------------------------------------------------------
  */
 static void
-WorkerEventSetupProc(TpoolWorker *poolWrk, int flags)
+WorkerEventSetupProc(ClientData poolWrkCD, int flags)
 {
+    TpoolWorker *poolWrk = poolWrkCD;
     ThreadPool *tpoolPtr;
     Tcl_Time    nowTime;
     int         nf = 0;
@@ -2197,8 +2195,9 @@ WorkerEventSetupProc(TpoolWorker *poolWrk, int flags)
  *----------------------------------------------------------------------
  */
 static void
-WorkerEventCheckProc(TpoolWorker *poolWrk, int flags)
+WorkerEventCheckProc(ClientData poolWrkCD, int flags)
 {
+    TpoolWorker *poolWrk = poolWrkCD;
     ThreadPool *tpoolPtr;
     Tcl_Time    nowTime, endOfWait; 
     int         nf = 0;
